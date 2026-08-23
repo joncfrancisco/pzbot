@@ -84,3 +84,42 @@ async def test_a_denial_is_audited_as_denied_not_failed(bot):
 
     _, kwargs = bot.ctx.audit.record.call_args
     assert kwargs["outcome"] == "denied"
+
+
+# --- The heartbeat (pzserver PZ-04) ---------------------------------------------------
+
+
+@pytest.fixture
+def heartbeat_bot(cfg, aws) -> PzBot:
+    """A bot whose presence update is stubbed, so the tests are about the heartbeat."""
+    instance = PzBot.__new__(PzBot)
+    instance.cfg = cfg
+    instance.ctx = SimpleNamespace(aws=aws)
+    instance._update_presence = AsyncMock()
+    return instance
+
+
+async def test_the_presence_loop_publishes_a_heartbeat(heartbeat_bot, aws):
+    # `.presence` is a discord.ext Loop object; call the wrapped coroutine directly.
+    await PzBot.presence.coro(heartbeat_bot)
+    assert "heartbeat" in aws.calls
+
+
+async def test_the_heartbeat_is_published_even_when_the_probe_fails(heartbeat_bot, aws):
+    # A transient DescribeInstances error means AWS is unhappy, not that this process is
+    # dead. Suppressing the heartbeat here would page someone about a bot running fine.
+    # AwsError is a tuple of exception classes for `except`, not something you raise --
+    # so this uses a real ClientError, the same one the error-handler tests use.
+    heartbeat_bot._update_presence.side_effect = client_error()
+    with pytest.raises(ClientError):
+        await PzBot.presence.coro(heartbeat_bot)
+    assert "heartbeat" in aws.calls
+
+
+async def test_a_failed_heartbeat_does_not_kill_the_presence_loop(heartbeat_bot, aws):
+    # tasks.loop stops on an unhandled exception. A PutMetricData throttle taking the
+    # presence loop down would turn a cosmetic failure into a real outage -- and would
+    # then trip the very alarm this metric feeds.
+    aws.heartbeat_fails = RuntimeError("PutMetricData throttled")
+    await PzBot.presence.coro(heartbeat_bot)  # must not raise
+    heartbeat_bot._update_presence.assert_awaited_once()

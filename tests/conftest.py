@@ -30,6 +30,8 @@ class FakeAws:
         self.backups: list[Backup] = []
         self.parameters: dict[str, str] = {}
         self.instance_id = "i-0test"
+        # Set to an exception to simulate PutMetricData failing.
+        self.heartbeat_fails: Exception | None = None
 
     async def describe(self, instance_id: str) -> Instance:
         self.calls.append(f"describe:{instance_id}")
@@ -81,6 +83,11 @@ class FakeAws:
     async def month_to_date(self, stack: str, instance_type: str = "") -> Cost:
         self.calls.append("cost")
         return Cost(stack_usd=12.34, account_usd=56.78, game_hours=41.5)
+
+    async def put_heartbeat(self, namespace: str, stack: str) -> None:
+        self.calls.append("heartbeat")
+        if self.heartbeat_fails is not None:
+            raise self.heartbeat_fails
 
 
 class FakeRcon:
