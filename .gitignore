@@ -1,0 +1,16 @@
+# Secrets and scratch. discord.tmp holds the app id / public key handed over by hand;
+# it is not a secret, but it is also not the source of truth -- deploy/pzbot.env is.
+discord.tmp
+*.env
+!deploy/pzbot.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage

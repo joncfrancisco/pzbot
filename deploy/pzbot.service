@@ -1,0 +1,50 @@
+# The bot. Always on, which is the entire reason the bot host exists: /pz start has to
+# work while the game server is powered off.
+
+[Unit]
+Description=pzbot - Discord control plane for the Project Zomboid server
+Documentation=https://github.com/joncfrancisco/pzbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pzbot
+Group=pzbot
+EnvironmentFile=/etc/pzbot/env
+WorkingDirectory=/opt/pzbot
+ExecStart=/opt/pzbot/venv/bin/pzbot
+# Unbuffered, or journald shows nothing until the process dies and flushes.
+Environment=PYTHONUNBUFFERED=1
+
+Restart=on-failure
+RestartSec=10
+# Exit 78 is EX_CONFIG: a missing parameter, or a token Discord rejected. Restarting into
+# the same wall every ten seconds buries the one useful log line under a thousand
+# identical ones, so the unit stops and waits for a human instead.
+RestartPreventExitStatus=78
+
+# This box has 512 MB. discord.py + boto3 sits around 150 MB resident; the ceiling is
+# here so a leak takes the bot down and restarts it, rather than taking down sshd's
+# replacement (the SSM agent) and locking everyone out of the host.
+MemoryHigh=220M
+MemoryMax=320M
+
+# The bot's whole job is to talk to two APIs. It has no reason to write to the disk, own
+# a privilege, or see anyone's home directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
