@@ -129,6 +129,29 @@ the world's actual state on the next command. The only thing lost is an in-fligh
 progress message, and the operation behind it (an EC2 start, an SSM command) carries on
 regardless — the state machine picks it up again on the next `/pz status`.
 
+**`/opt/pzbot/src` is the one checkout.** Nothing enforces that, and it is easy to clone a
+second one somewhere else during a hurried deploy and end up upgrading the copy that is
+not installed. If in doubt, `git -C /opt/pzbot/src log --oneline -1` should match
+`origin/main`, and there should be no other checkout under `/opt`.
+
+**Verify the deployed code, not just the service state.** `systemctl is-active` says
+nothing about *which build* is running — a stale install looks identical. Grep the
+installed package:
+
+```bash
+P=/opt/pzbot/venv/lib64/python3.12/site-packages/pzbot
+grep -c "def budget" $P/guards.py       # PZ-08 budget kill-switch
+grep -c "put_heartbeat" $P/aws.py       # PZ-04 heartbeat
+/opt/pzbot/venv/bin/pip list --format=freeze | grep -E '^(discord.py|boto3)='
+```
+
+And confirm the heartbeat is actually reaching CloudWatch, which is the only check that
+proves the event loop is alive end to end:
+
+```bash
+aws cloudwatch list-metrics --namespace PZ --metric-name BotAlive
+```
+
 ## Changing the world's rules
 
 Two files, two commands, and the difference is which one needs a restart.
