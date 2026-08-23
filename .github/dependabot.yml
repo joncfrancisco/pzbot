@@ -1,0 +1,37 @@
+# Upgrades become a reviewed, testable event with a CI run attached, rather than a side
+# effect of whenever deploy/install.sh next happens to run.
+#
+# That is the whole point of pinning: requirements.txt is now a lockfile, so nothing moves
+# on its own -- which is only an improvement if something is still telling us when we have
+# fallen behind on a security patch. This is that something.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps"
+    # Dependabot updates requirements.txt in place and regenerates the hashes, so the
+    # lockfile stays valid for --require-hashes. requirements.in is the human-edited
+    # source of the ranges and is left alone.
+    groups:
+      # One PR for the AWS SDK. boto3 and botocore version in lockstep, and separate PRs
+      # for them would each invalidate the other.
+      aws:
+        patterns: ["boto3", "botocore", "s3transfer", "jmespath"]
+      # aiohttp and its own dependency tree move together too.
+      discord:
+        patterns: ["discord*", "aiohttp", "aiosignal", "aiohappyeyeballs", "frozenlist", "multidict", "propcache", "yarl", "attrs"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci"

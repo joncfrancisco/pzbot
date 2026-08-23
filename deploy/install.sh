@@ -74,7 +74,24 @@ fi
 
 log "installing dependencies"
 "${VENV}/bin/pip" install --quiet --upgrade pip
-"${VENV}/bin/pip" install --quiet -r "${REPO}/requirements.txt"
+
+# --require-hashes. requirements.txt is a pip-compile lockfile: every package pinned to an
+# exact version and every artifact pinned to a hash, transitive dependencies included.
+#
+# This host holds ec2:StartInstances, ec2:StopInstances, root shell on the game server and
+# the decrypted Discord token. It is the highest-value box in the stack, and until now it
+# had the loosest supply chain: the old ranges (discord.py>=2.4,<3, boto3>=1.34) meant
+# every redeploy resolved whatever minor and patch PyPI happened to be serving that
+# afternoon, unverified. The file's own comment claimed it existed so "a redeploy cannot
+# silently pull a new major of discord.py onto a box nobody is watching" -- true of majors
+# only.
+#
+# --require-hashes also fails closed on an incomplete lockfile: if requirements.txt is
+# edited by hand and a transitive dependency loses its hash, pip refuses the whole install
+# rather than quietly falling back. Regenerate with pip-compile, never by hand.
+"${VENV}/bin/pip" install --quiet --require-hashes -r "${REPO}/requirements.txt"
+
+# --no-deps, so the application itself cannot pull anything past the lockfile.
 "${VENV}/bin/pip" install --quiet --no-deps "${REPO}"
 
 # --- Configuration --------------------------------------------------------------------------

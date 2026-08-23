@@ -33,3 +33,30 @@ jobs:
       - name: Shellcheck the installer
         # It runs as root on the only host that can reach the game server. Worth linting.
         run: shellcheck deploy/install.sh
+
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Must match the host: pip-compile resolves for the interpreter it runs on, so
+          # compiling under a different minor can pin a different dependency set.
+          python-version: "3.12"
+
+      # install.sh runs `pip install --require-hashes`, which fails closed if any package
+      # in the file lacks a hash -- so a requirements.in edit that nobody recompiled shows
+      # up as a broken DEPLOY, on the box with no SSH, rather than as a failed CI run.
+      # This is that failed CI run.
+      - name: requirements.txt is in sync with requirements.in
+        run: |
+          pip install --quiet pip-tools
+          cp requirements.txt requirements.txt.committed
+          pip-compile --generate-hashes --strip-extras --quiet \
+            --output-file=requirements.txt requirements.in
+          if ! diff -u requirements.txt.committed requirements.txt; then
+            echo "::error::requirements.txt is stale. Regenerate it:"
+            echo "  pip-compile --generate-hashes --strip-extras --output-file=requirements.txt requirements.in"
+            exit 1
+          fi
+          echo "lockfile is current"
