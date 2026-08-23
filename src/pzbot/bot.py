@@ -132,7 +132,12 @@ class PzBot(discord.Client):
             case OperationError():
                 embed = render.error(str(original))
                 outcome = "failed"
-            case AwsError():
+            case _ if isinstance(original, AwsError):
+                # AwsError is `(ClientError, BotoCoreError)` -- a tuple, which `except`
+                # accepts but a `case` class pattern does not. `case AwsError():` raises
+                # `TypeError: called match pattern must be a class` at match time, which
+                # took down the error handler itself and hid the real failure (an IAM
+                # AccessDenied) behind a second, unrelated crash.
                 log.exception("AWS call failed during /pz %s", action)
                 embed = render.error(
                     "AWS refused or timed out on that. The stack itself is probably fine "
