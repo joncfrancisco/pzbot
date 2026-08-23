@@ -278,6 +278,36 @@ class Aws:
 
         return await asyncio.to_thread(call)
 
+    async def put_heartbeat(self, namespace: str, stack: str) -> None:
+        """Publish PZ/BotAlive=1.
+
+        The alarm on the other end of this treats missing data as breaching, which is what
+        makes it a heartbeat rather than a status check. pzserver's EC2 status-check alarms
+        cover a dead host; this covers the failure they structurally cannot see -- instance
+        healthy, process running, asyncio event loop wedged or the gateway connection
+        silently dead. From the outside that is indistinguishable from a working bot right
+        up until someone types `/pz start` and gets nothing.
+
+        The caller is the presence loop, so this is only published once the loop has
+        actually completed a cycle of real work. Publishing it from a bare timer would
+        make it a liveness check on the timer rather than on the bot.
+        """
+
+        def call() -> None:
+            self._cw.put_metric_data(
+                Namespace=namespace,
+                MetricData=[
+                    {
+                        "MetricName": "BotAlive",
+                        "Dimensions": [{"Name": "Stack", "Value": stack}],
+                        "Value": 1,
+                        "Unit": "None",
+                    }
+                ],
+            )
+
+        await asyncio.to_thread(call)
+
     # --- Cost Explorer ---------------------------------------------------------------
 
     async def month_to_date(self, stack: str, instance_type: str = "") -> Cost:

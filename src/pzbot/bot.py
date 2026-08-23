@@ -69,13 +69,38 @@ class PzBot(discord.Client):
 
     @tasks.loop(seconds=60)
     async def presence(self) -> None:
-        """Put the server's state in the member list, where nobody has to ask for it.
+        """Put the server's state in the member list, and prove this process is alive.
 
         Most `/pz status` calls are really the question "is it up?", and this answers that
         without anyone typing anything. It is also a live probe of the whole path --
         DescribeInstances plus RCON -- so a broken RCON password shows up in the sidebar
         rather than the first time someone tries to stop the server.
         """
+        try:
+            await self._update_presence()
+        finally:
+            # In a `finally`, and therefore published even when the probe above failed.
+            # The heartbeat's claim is "this event loop completed a cycle", not "AWS is
+            # healthy" -- a transient DescribeInstances error must not page someone about
+            # a bot that is in fact running fine. It is published AFTER the probe rather
+            # than before so that it still requires a full cycle of real work, which is
+            # what stops it degenerating into a liveness check on the timer itself.
+            await self._heartbeat()
+
+    async def _heartbeat(self) -> None:
+        """PZ/BotAlive=1. Never allowed to raise -- see the alarm's own comment.
+
+        pzserver's EC2 status-check alarms cover a dead host. This covers the failure they
+        structurally cannot see: healthy instance, running process, wedged event loop.
+        """
+        try:
+            await self.ctx.aws.put_heartbeat(self.cfg.metric_namespace, self.cfg.stack)
+        except Exception:  # noqa: BLE001 -- a failed heartbeat must not kill the loop
+            # Deliberately not fatal, and deliberately not silent: the alarm will notice
+            # the absence on its own, and this line is what explains it afterwards.
+            log.warning("could not publish the BotAlive heartbeat", exc_info=True)
+
+    async def _update_presence(self) -> None:
         try:
             snap = await self.ctx.server.probe(rcon_timeout=4.0)
         except AwsError:
