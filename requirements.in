@@ -1,0 +1,8 @@
+# The direct dependencies, with the ranges we actually intend. This is the file a human
+# edits; requirements.txt is generated from it and is what gets installed.
+#
+#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+#
+# Regenerate on any intentional upgrade, and let Dependabot open the PR for the rest.
+discord.py>=2.4,<3
+boto3>=1.34

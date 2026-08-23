@@ -7,9 +7,11 @@ default**. Runs as `pzbot.service` on the always-on `t4g.nano` bot host in accou
 `020949219706`. The design of record is pzserver's `DESIGN.md` §10 — that table is the
 contract this repo implements, and `tests/test_commands.py` asserts it.
 
-**Nothing is deployed yet.** The code is written and tested; the Discord application's
-bot user, the six `/pz/prod/discord/*` parameters and `deploy/install.sh` have not been
-run. See [DEPLOY.md](DEPLOY.md).
+**The code is written and tested; it is not deployed.** The Discord application's bot
+user, the six `/pz/prod/discord/*` parameters and `deploy/install.sh` have still not been
+run. Note that the *infrastructure* it runs on IS live — [pzserver](../pzserver) was
+applied on 2026-08-22 and the bot host `i-09158ffe716ee3c5e` is up and billing — so this
+is the only remaining gap between the two repos. See [DEPLOY.md](DEPLOY.md).
 
 ## Stack & Commands
 Python 3.12 · `discord.py` 2.x (app commands, gateway) · `boto3` · vendored async RCON ·
@@ -18,7 +20,7 @@ systemd on AL2023 arm64. No web framework, no database, no state on disk.
 ```bash
 pip install -e '.[dev]'
 ruff check src tests && ruff format --check src tests
-pytest -q                      # 127 tests, no network, ~1s
+pytest -q                      # 133 tests, no network, ~2s
 ```
 
 There is no Python 3.12 on this Mac (system Python is 3.9, and there is no Homebrew).
@@ -54,6 +56,8 @@ src/pzbot/
     backups.py   ← /pz backup now|list and the restore autocomplete
     world.py     ← /pz sandbox get|set, with both halves of the picker autocompleted
 deploy/          ← pzbot.service, install.sh (idempotent; also the upgrade path), env template
+requirements.in  ← the direct deps and their intended ranges; humans edit THIS
+requirements.txt ← pip-compile lockfile, fully pinned + hashed; install.sh --require-hashes
 tests/           ← fakes for AWS and RCON; the socket tests speak real RCON over loopback
 ```
 
@@ -123,6 +127,11 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   through a real shell.
 - **`deploy/install.sh` must stay idempotent** — it is the upgrade path, and it runs as
   root on the only host that can reach the game server.
+- **Never hand-edit `requirements.txt`.** It is a `pip-compile` lockfile and the installer
+  uses `--require-hashes`, which fails closed if any package lacks a hash — so a hand edit
+  surfaces as a broken deploy on the box with no SSH. Edit `requirements.in` and run
+  `pip-compile --generate-hashes --strip-extras --output-file=requirements.txt requirements.in`.
+  CI checks the two are in sync.
 - **Files must stay LF** (`.gitattributes`), same rule as pzserver: `deploy/` lands on
   Linux and is read by shebang and systemd's parser.
 
