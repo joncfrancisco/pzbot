@@ -7,11 +7,13 @@ default**. Runs as `pzbot.service` on the always-on `t4g.nano` bot host in accou
 `020949219706`. The design of record is pzserver's `DESIGN.md` §10 — that table is the
 contract this repo implements, and `tests/test_commands.py` asserts it.
 
-**The code is written and tested; it is not deployed.** The Discord application's bot
-user, the six `/pz/prod/discord/*` parameters and `deploy/install.sh` have still not been
-run. Note that the *infrastructure* it runs on IS live — [pzserver](../pzserver) was
-applied on 2026-08-22 and the bot host `i-09158ffe716ee3c5e` is up and billing — so this
-is the only remaining gap between the two repos. See [DEPLOY.md](DEPLOY.md).
+**This is live.** [pzserver](../pzserver) was applied on 2026-08-22 and `pzbot.service`
+has been running on the bot host `i-09158ffe716ee3c5e` since 2026-08-23 — the Discord
+application, the `/pz/prod/discord/*` parameters and `deploy/install.sh` are all done.
+Changes merged here do **not** reach the box on their own; deploying is a `git pull` plus
+`deploy/install.sh` over SSM. Check what is actually running with
+`git -C /opt/pzbot/src log --oneline -1` before assuming main and prod agree. See
+[DEPLOY.md](DEPLOY.md).
 
 ## Stack & Commands
 Python 3.12 · `discord.py` 2.x (app commands, gateway) · `boto3` · vendored async RCON ·
