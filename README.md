@@ -7,7 +7,8 @@ few minutes, and it shuts itself down when the last person leaves. Compute cost 
 play time instead of wall-clock time.
 
 Runs as `pzbot.service` on the always-on `t4g.nano` bot host, which is a separate box for
-one reason: `/pz start` has to work while the game server is powered off.
+one reason: `/pz start` has to work while the game server is powered off. A one-page map
+of the whole AWS account is in [joninfra](https://github.com/joncfrancisco/joninfra).
 
 ```
 Discord ──▶ pzbot (t4g.nano, always on)
@@ -73,16 +74,23 @@ so "saliva only" is a thing you pick rather than something you have to know is
 
 ## Status
 
-**Written and tested; not yet deployed.** 127 tests pass, and configuration loading and
-the read-only probe path are verified against the live `prod` stack. What is left is
-external setup, all of it in [DEPLOY.md](DEPLOY.md):
+**Deployed and running.** `pzbot.service` is `active (running)` and `enabled` on the bot
+host `i-09158ffe716ee3c5e`, serving guild `189561197673054208` against the live `prod`
+stack. 127 tests pass. All three setup steps — the Discord application, the
+`/pz/prod/discord/*` parameters, and `deploy/install.sh` — are done; they are kept in
+[DEPLOY.md](DEPLOY.md) for rebuilds and rotations.
 
-1. create the Discord application's bot user and invite it to the guild;
-2. put six values under `/pz/prod/discord/` in Parameter Store;
-3. run `deploy/install.sh` on the bot host over SSM.
+To see which build is actually on the box:
 
-Until then, start and stop are `aws ec2 start-instances` / `stop-instances` — see
-pzserver's [DEPLOY.md § Running it by hand](https://github.com/joncfrancisco/pzserver/blob/main/DEPLOY.md#running-it-by-hand-before-the-bot-exists).
+```bash
+aws ssm start-session --target i-09158ffe716ee3c5e
+git -C /opt/pzbot/src log --oneline -1
+```
+
+`/pz start` is the normal way to bring the world up. The CLI equivalents
+(`aws ec2 start-instances` / `stop-instances`) still work and are the fallback for when
+Discord itself is the broken part — see pzserver's
+[DEPLOY.md § Running it by hand](https://github.com/joncfrancisco/pzserver/blob/main/DEPLOY.md#running-it-by-hand-before-the-bot-exists).
 
 ## Layout
 

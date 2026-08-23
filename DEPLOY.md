@@ -108,8 +108,12 @@ A healthy start logs one line with the resolved configuration:
 
 ```
 INFO pzbot: stack=prod region=us-east-1 game=i-0c319547d110e4179 rcon=10.20.1.171:27015 connect=pz.joncfrancis.co:16261
-INFO pzbot.bot: synced 13 commands to guild …
+INFO pzbot.bot: synced 1 commands to guild …
 ```
+
+**`synced 1` is correct, not a truncated sync.** Everything is a subcommand of the single
+`/pz` group, and Discord counts top-level commands. The thirteen subcommands are inside
+that one. To see them, use `/pz` in the client rather than counting log lines.
 
 Then, in Discord: `/pz status` should answer with `⚫ Stopped` and the fixed-floor note.
 `/pz start` is the real test — three to seven minutes, one message that edits itself.
