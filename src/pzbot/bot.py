@@ -29,9 +29,15 @@ log = logging.getLogger(__name__)
 
 class PzBot(discord.Client):
     def __init__(self, cfg: Config, aws: Aws) -> None:
-        # No privileged intents, and no message content: everything this bot does happens
-        # through interactions, so it never needs to read what anyone types.
-        super().__init__(intents=discord.Intents.none())
+        # No privileged intents (Members, Presences, Message Content) and no message
+        # content: every command here happens through interactions, so the bot never
+        # needs to read what anyone types. GUILDS is not privileged, though, and
+        # discord.py wants it regardless -- without it there is no guild/channel cache,
+        # so `audit.py`'s channel lookup falls back to an HTTP fetch on every single
+        # audit line instead of using it.
+        intents = discord.Intents.none()
+        intents.guilds = True
+        super().__init__(intents=intents)
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
         self.ctx = Ctx(
