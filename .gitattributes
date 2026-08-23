@@ -1,0 +1,8 @@
+# Same rule as pzserver and foodblog: anything that lands on a Linux box and is read by
+# a shebang or systemd's parser must stay LF. CRLF breaks both obscurely.
+* text=auto eol=lf
+
+deploy/* text eol=lf
+*.sh     text eol=lf
+*.service text eol=lf
+*.py     text eol=lf

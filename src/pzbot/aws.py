@@ -1,0 +1,347 @@
+"""The AWS surface, and nothing more than the AWS surface.
+
+boto3 is synchronous and the gateway client is not, so every call here is pushed to a
+worker thread. That matters more than it looks: a `DescribeInstances` that blocks the
+event loop for 400 ms blocks Discord's heartbeat too, and a bot that misses heartbeats
+gets disconnected mid-start.
+
+The methods map one-to-one onto the statements in `pz-bot-role` (pzserver DESIGN section
+9). If a method here needs a permission that policy does not grant, the policy is the
+thing to change -- not this file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+from dataclasses import dataclass
+
+import boto3
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
+
+log = logging.getLogger(__name__)
+
+AwsError = (ClientError, BotoCoreError)
+
+# Short timeouts with retries, rather than long ones: a wedged API call must surface as
+# an error inside an interaction's lifetime, not hang a progress embed for a minute.
+_BOTO = BotoConfig(
+    retries={"max_attempts": 5, "mode": "standard"},
+    connect_timeout=5,
+    read_timeout=20,
+    user_agent_extra="pzbot/1.0",
+)
+
+
+@dataclass(frozen=True)
+class Instance:
+    instance_id: str
+    state: str  # pending | running | stopping | stopped | shutting-down | terminated
+    private_ip: str
+    public_ip: str
+    launch_time: dt.datetime | None
+    instance_type: str
+
+    @property
+    def is_running(self) -> bool:
+        return self.state == "running"
+
+    @property
+    def is_stopped(self) -> bool:
+        return self.state == "stopped"
+
+    @property
+    def in_transition(self) -> bool:
+        return self.state in ("pending", "stopping", "shutting-down")
+
+
+@dataclass(frozen=True)
+class Backup:
+    key: str
+    size: int
+    modified: dt.datetime
+
+    @property
+    def name(self) -> str:
+        return self.key.rsplit("/", 1)[-1]
+
+    @property
+    def stamp(self) -> str:
+        return self.name.split("__", 1)[0]
+
+    @property
+    def trigger(self) -> str:
+        parts = self.name.removesuffix(".tar.zst").split("__")
+        return parts[1] if len(parts) > 1 else "?"
+
+    @property
+    def label(self) -> str:
+        parts = self.name.removesuffix(".tar.zst").split("__")
+        return parts[2] if len(parts) > 2 else ""
+
+
+@dataclass(frozen=True)
+class Cost:
+    stack_usd: float
+    account_usd: float
+    game_hours: float | None
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    status: str  # Success | Failed | TimedOut | Cancelled
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "Success"
+
+    @property
+    def output(self) -> str:
+        """What to show a human. The ops scripts log to stderr, so it comes first."""
+        return "\n".join(p.strip() for p in (self.stderr, self.stdout) if p.strip())
+
+
+class Aws:
+    def __init__(self, region: str) -> None:
+        session = boto3.session.Session(region_name=region)
+        self.region = region
+        self._ec2 = session.client("ec2", config=_BOTO)
+        self._ssm = session.client("ssm", config=_BOTO)
+        self._s3 = session.client("s3", config=_BOTO)
+        self._cw = session.client("cloudwatch", config=_BOTO)
+        # Cost Explorer is a us-east-1-only endpoint regardless of where the stack runs.
+        self._ce = session.client("ce", region_name="us-east-1", config=_BOTO)
+
+    # --- Parameter Store -------------------------------------------------------------
+
+    async def get_parameters_by_path(self, prefix: str) -> dict[str, str]:
+        def call() -> dict[str, str]:
+            out: dict[str, str] = {}
+            paginator = self._ssm.get_paginator("get_parameters_by_path")
+            for page in paginator.paginate(Path=prefix, Recursive=True, WithDecryption=True):
+                for p in page["Parameters"]:
+                    out[p["Name"]] = p["Value"]
+            return out
+
+        return await asyncio.to_thread(call)
+
+    # --- EC2 -------------------------------------------------------------------------
+
+    async def find_instance(self, *, stack: str, role: str) -> str:
+        """The one instance carrying these tags, or "".
+
+        Terminated instances linger in DescribeInstances for an hour after a rebuild, so
+        they are filtered out explicitly -- otherwise a fresh stack could be resolved to
+        the corpse of the old one.
+        """
+
+        def call() -> str:
+            resp = self._ec2.describe_instances(
+                Filters=[
+                    {"Name": "tag:pz:stack", "Values": [stack]},
+                    {"Name": "tag:pz:role", "Values": [role]},
+                    {
+                        "Name": "instance-state-name",
+                        "Values": ["pending", "running", "stopping", "stopped"],
+                    },
+                ]
+            )
+            ids = [i["InstanceId"] for r in resp["Reservations"] for i in r["Instances"]]
+            if len(ids) > 1:
+                log.warning("%d instances tagged pz:role=%s in %s: %s", len(ids), role, stack, ids)
+            return ids[0] if ids else ""
+
+        return await asyncio.to_thread(call)
+
+    async def describe(self, instance_id: str) -> Instance:
+        def call() -> Instance:
+            resp = self._ec2.describe_instances(InstanceIds=[instance_id])
+            raw = resp["Reservations"][0]["Instances"][0]
+            return Instance(
+                instance_id=raw["InstanceId"],
+                state=raw["State"]["Name"],
+                private_ip=raw.get("PrivateIpAddress", ""),
+                public_ip=raw.get("PublicIpAddress", ""),
+                launch_time=raw.get("LaunchTime"),
+                instance_type=raw.get("InstanceType", ""),
+            )
+
+        return await asyncio.to_thread(call)
+
+    async def private_ip(self, instance_id: str) -> str:
+        return (await self.describe(instance_id)).private_ip
+
+    async def start_instance(self, instance_id: str) -> str:
+        def call() -> str:
+            resp = self._ec2.start_instances(InstanceIds=[instance_id])
+            return resp["StartingInstances"][0]["CurrentState"]["Name"]
+
+        return await asyncio.to_thread(call)
+
+    async def stop_instance(self, instance_id: str) -> str:
+        def call() -> str:
+            resp = self._ec2.stop_instances(InstanceIds=[instance_id])
+            return resp["StoppingInstances"][0]["CurrentState"]["Name"]
+
+        return await asyncio.to_thread(call)
+
+    # --- Run Command -----------------------------------------------------------------
+
+    async def run_shell(
+        self,
+        instance_id: str,
+        commands: list[str],
+        *,
+        timeout: int = 600,
+        comment: str = "pzbot",
+    ) -> CommandResult:
+        """Run a command on the game server and wait for it.
+
+        Callers pass fixed command strings that invoke the `/opt/pz/bin` scripts. Nothing
+        in this file interpolates user input into a shell command, and nothing should:
+        the IAM policy stops a Discord message becoming arbitrary AWS actions, but only
+        this rule stops one becoming arbitrary *shell*.
+        """
+
+        def send() -> str:
+            resp = self._ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": commands, "executionTimeout": [str(timeout)]},
+                Comment=comment[:100],
+            )
+            return resp["Command"]["CommandId"]
+
+        command_id = await asyncio.to_thread(send)
+
+        def poll() -> dict:
+            return self._ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+
+        deadline = asyncio.get_running_loop().time() + timeout + 30
+        while True:
+            await asyncio.sleep(2)
+            try:
+                inv = await asyncio.to_thread(poll)
+            except ClientError as exc:
+                # The invocation is not queryable for a beat after send_command.
+                if exc.response["Error"]["Code"] == "InvocationDoesNotExist":
+                    if asyncio.get_running_loop().time() > deadline:
+                        raise
+                    continue
+                raise
+            if inv["Status"] not in ("Pending", "InProgress", "Delayed"):
+                return CommandResult(
+                    status=inv["Status"],
+                    stdout=inv.get("StandardOutputContent", ""),
+                    stderr=inv.get("StandardErrorContent", ""),
+                )
+            if asyncio.get_running_loop().time() > deadline:
+                return CommandResult("TimedOut", inv.get("StandardOutputContent", ""), "")
+
+    # --- S3 --------------------------------------------------------------------------
+
+    async def list_backups(self, bucket: str, stack: str, limit: int = 200) -> list[Backup]:
+        def call() -> list[Backup]:
+            out: list[Backup] = []
+            paginator = self._s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket, Prefix=f"backups/{stack}/"):
+                for obj in page.get("Contents", []):
+                    if obj["Key"].endswith(".tar.zst"):
+                        out.append(Backup(obj["Key"], obj["Size"], obj["LastModified"]))
+            out.sort(key=lambda b: b.modified, reverse=True)
+            return out[:limit]
+
+        return await asyncio.to_thread(call)
+
+    # --- CloudWatch ------------------------------------------------------------------
+
+    async def latest_metric(
+        self, namespace: str, metric: str, stack: str, *, minutes: int = 15
+    ) -> float | None:
+        def call() -> float | None:
+            now = dt.datetime.now(dt.UTC)
+            resp = self._cw.get_metric_statistics(
+                Namespace=namespace,
+                MetricName=metric,
+                Dimensions=[{"Name": "Stack", "Value": stack}],
+                StartTime=now - dt.timedelta(minutes=minutes),
+                EndTime=now,
+                Period=60,
+                Statistics=["Maximum"],
+            )
+            points = sorted(resp["Datapoints"], key=lambda d: d["Timestamp"])
+            return points[-1]["Maximum"] if points else None
+
+        return await asyncio.to_thread(call)
+
+    # --- Cost Explorer ---------------------------------------------------------------
+
+    async def month_to_date(self, stack: str, instance_type: str = "") -> Cost:
+        """Spend and running hours for the current month.
+
+        Three calls, because they answer three different questions:
+
+        *   the stack's spend, filtered by the `pz:stack` cost allocation tag;
+        *   the whole account's spend, which is what makes it obvious when the tag has
+            not been activated -- without it, the stack figure is silently $0.00 and
+            reads as "we spent nothing" rather than "we cannot tell";
+        *   running hours for the game instance type, which is the number that actually
+            explains the bill.
+
+        Cost Explorer charges $0.01 per request and its data lags by up to a day, so
+        callers are expected to cache this. See `commands.base.Cached`.
+        """
+
+        def call() -> Cost:
+            today = dt.datetime.now(dt.UTC).date()
+            window = {
+                "TimePeriod": {
+                    "Start": today.replace(day=1).isoformat(),
+                    "End": (today + dt.timedelta(days=1)).isoformat(),
+                },
+                "Granularity": "MONTHLY",
+            }
+            tag_filter = {"Tags": {"Key": "pz:stack", "Values": [stack]}}
+
+            def total(resp: dict) -> float:
+                return sum(
+                    float(r["Total"]["UnblendedCost"]["Amount"]) for r in resp["ResultsByTime"]
+                )
+
+            tagged = self._ce.get_cost_and_usage(
+                **window, Metrics=["UnblendedCost"], Filter=tag_filter
+            )
+            account = self._ce.get_cost_and_usage(**window, Metrics=["UnblendedCost"])
+
+            hours = None
+            if instance_type:
+                usage = self._ce.get_cost_and_usage(
+                    **window,
+                    Metrics=["UsageQuantity"],
+                    Filter={
+                        "And": [
+                            tag_filter,
+                            {
+                                "Dimensions": {
+                                    "Key": "USAGE_TYPE_GROUP",
+                                    "Values": ["EC2: Running Hours"],
+                                }
+                            },
+                        ]
+                    },
+                    GroupBy=[{"Type": "DIMENSION", "Key": "INSTANCE_TYPE"}],
+                )
+                for period in usage["ResultsByTime"]:
+                    for group in period.get("Groups", []):
+                        if group["Keys"] and group["Keys"][0] == instance_type:
+                            hours = (hours or 0.0) + float(
+                                group["Metrics"]["UsageQuantity"]["Amount"]
+                            )
+
+            return Cost(stack_usd=total(tagged), account_usd=total(account), game_hours=hours)
+
+        return await asyncio.to_thread(call)

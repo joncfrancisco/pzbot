@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The bot host runs 3.12 (AL2023's python3.12 package). Testing on anything
+          # else tests something nobody deploys.
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Lint
+        run: |
+          ruff check src tests
+          ruff format --check src tests
+      - name: Test
+        run: pytest -q
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck the installer
+        # It runs as root on the only host that can reach the game server. Worth linting.
+        run: shellcheck deploy/install.sh

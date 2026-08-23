@@ -1,0 +1,5 @@
+# What actually gets installed on the bot host. deploy/install.sh uses this file, not
+# the ranges in pyproject.toml, so a redeploy cannot silently pull a new major of
+# discord.py onto a box nobody is watching.
+discord.py>=2.4,<3
+boto3>=1.34
