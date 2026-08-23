@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # The bot host runs 3.12 (AL2023's python3.12 package). Testing on anything
           # else tests something nobody deploys.
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # Must match the host: pip-compile resolves for the interpreter it runs on, so
           # compiling under a different minor can pin a different dependency set.
