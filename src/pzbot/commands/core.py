@@ -92,8 +92,58 @@ class PzGroup(app_commands.Group, name="pz", description="Project Zomboid server
     # --- Lifecycle -------------------------------------------------------------------
 
     @app_commands.command(description="Start the server and wait until it is ready to play")
-    async def start(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        override="Start anyway despite the month's budget being spent. Admin only, and logged."
+    )
+    async def start(self, interaction: discord.Interaction, override: bool = False) -> None:
         guards.check(interaction, self.ctx.cfg, Tier.PLAYER)
+
+        # DESIGN section 12's third cost-control layer. The number is already fetched and
+        # cached for /pz status and /pz cost; this is the gate that was missing.
+        #
+        # Deliberately BEFORE the single-flight lock and before Live opens: a refusal
+        # should be a cheap ephemeral no-op, not a progress message that then fails, and
+        # it must not hold the lock while it decides.
+        spend = None
+        if self.ctx.cfg.runtime.monthly_budget_usd > 0:
+            await refresh_runtime(self.ctx.aws, self.ctx.cfg)
+            try:
+                instance = await self.ctx.aws.describe(self.ctx.cfg.game_instance_id)
+                spend = await self.ctx.spend.get(
+                    lambda: self.ctx.aws.month_to_date(self.ctx.cfg.stack, instance.instance_type)
+                )
+            except AwsError:
+                # See guards.budget: a Cost Explorer outage must not become "nobody can
+                # play". The watchdog on the box is the actual money guarantee.
+                log.warning("could not read Cost Explorer to gate /pz start", exc_info=True)
+
+        guards.budget(
+            self.ctx.cfg,
+            spend,
+            is_admin_user=guards.is_admin(interaction.user, self.ctx.cfg),
+            override=override,
+        )
+
+        if override and spend is not None:
+            # Loudly logged, per DESIGN. Recorded BEFORE the start, so an override that
+            # then fails halfway is still on the record -- the audit trail is about who
+            # decided to spend the money, not about whether it worked.
+            await self.ctx.audit.record(
+                interaction,
+                "start override",
+                detail=(
+                    f"budget override: ${spend.stack_usd:.2f} spent against "
+                    f"${self.ctx.cfg.runtime.monthly_budget_usd:.2f}"
+                ),
+            )
+            log.warning(
+                "BUDGET OVERRIDE by %s (%s): $%.2f spent against $%.2f",
+                interaction.user,
+                interaction.user.id,
+                spend.stack_usd,
+                self.ctx.cfg.runtime.monthly_budget_usd,
+            )
+
         live = Live(interaction, "Starting the server")
         await live.open("Checking what the server is actually doing\N{HORIZONTAL ELLIPSIS}")
 
