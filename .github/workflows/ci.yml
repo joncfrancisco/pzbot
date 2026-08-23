@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           # The bot host runs 3.12 (AL2023's python3.12 package). Testing on anything
@@ -29,7 +29,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Shellcheck the installer
         # It runs as root on the only host that can reach the game server. Worth linting.
         run: shellcheck deploy/install.sh
@@ -37,7 +37,7 @@ jobs:
   lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           # Must match the host: pip-compile resolves for the interpreter it runs on, so
