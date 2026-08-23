@@ -45,6 +45,13 @@ def _int(value: str | None, default: int) -> int:
         return default
 
 
+def _float(value: str | None, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _ids(value: str | None) -> tuple[int, ...]:
     """Parse a comma-separated list of Discord snowflakes.
 
@@ -76,6 +83,15 @@ class Runtime:
     idle_timeout_min: int = 30
     session_cap_hours: int = 12
     xmx: str = ""
+
+    # The ceiling `/pz start` refuses past, for the player tier. Runtime rather than
+    # startup config on purpose: this is the one knob whose whole job is to be retuned
+    # when it turns out to be set wrong, and needing a redeploy to raise a budget in the
+    # middle of the month you have blown it is exactly the wrong ergonomics.
+    #
+    # 0.0 means no gate. That is the honest default for an unconfigured bot -- see
+    # guards.budget for why this whole layer fails OPEN rather than closed.
+    monthly_budget_usd: float = 0.0
 
 
 @dataclass
@@ -227,6 +243,12 @@ async def load(aws) -> Config:
             idle_timeout_min=_int(param("config/idle_timeout_min"), 30),
             session_cap_hours=_int(param("config/session_cap_hours"), 12),
             xmx=param("config/xmx"),
+            monthly_budget_usd=_float(
+                param("config/monthly_budget_usd"),
+                # bot_contract is the fallback for a fresh install whose Parameter Store
+                # tree predates pzserver publishing this value.
+                _float(str(contract.get("monthly_budget_usd") or ""), 0.0),
+            ),
         ),
     )
 
@@ -251,5 +273,6 @@ async def refresh_runtime(aws, cfg: Config) -> Runtime:
         idle_timeout_min=_int(param("idle_timeout_min"), cfg.runtime.idle_timeout_min),
         session_cap_hours=_int(param("session_cap_hours"), cfg.runtime.session_cap_hours),
         xmx=param("xmx", cfg.runtime.xmx),
+        monthly_budget_usd=_float(param("monthly_budget_usd"), cfg.runtime.monthly_budget_usd),
     )
     return cfg.runtime

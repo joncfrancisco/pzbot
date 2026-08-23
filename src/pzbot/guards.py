@@ -59,6 +59,62 @@ def check(interaction: discord.Interaction, cfg: Config, tier: Tier) -> None:
         raise Denied(f"You need <@&{cfg.role_player}> to use `/pz`.")
 
 
+def budget(cfg: Config, spend, *, is_admin_user: bool, override: bool) -> None:
+    """The third cost-control layer from pzserver DESIGN section 12.
+
+    "At 100%, the bot stops the server and refuses `/pz start` from the player tier;
+    pz-admin can override with an explicit `/pz start override:true` that is loudly
+    logged."
+
+    The bot already fetched and cached this number for `/pz status` and `/pz cost`; it
+    simply never gated on it. Combined with the watchdog missing the crashed-unit case and
+    the budget alarm only reaching email, all three of DESIGN's cost-control layers had a
+    hole in them.
+
+    FAILS OPEN, in three places, and each is deliberate:
+
+      * `monthly_budget_usd` unset (0.0) -- an unconfigured ceiling is not a ceiling of
+        zero. Refusing every start because nobody published the parameter would be a
+        self-inflicted outage.
+      * `spend is None` -- Cost Explorer was unreachable or errored. `/pz status` already
+        treats that as decoration rather than failure, and a Cost Explorer outage must not
+        become "nobody can play".
+      * stack_usd == 0.0 while the account has spent something -- the signature of the
+        `pz:stack` cost allocation tag not being activated (pzserver DEPLOY.md step 1),
+        which makes the tagged figure a meaningless $0.00 rather than a real zero.
+        Gating on a number we know to be fictional would refuse starts for the wrong
+        reason, and `render.cost` already surfaces the condition itself.
+
+    Failing open on a *refusal* is the right direction: the money guarantee is enforced on
+    the box by pz-watchdog.sh, which needs neither Discord nor Cost Explorer to work. This
+    layer is the polite early stop, not the backstop.
+    """
+    limit = cfg.runtime.monthly_budget_usd
+    if limit <= 0 or spend is None:
+        return
+    if spend.stack_usd <= 0 < spend.account_usd:
+        return
+    if spend.stack_usd < limit:
+        return
+
+    if override:
+        if not is_admin_user:
+            raise Denied(
+                f"Spend this month is **${spend.stack_usd:.2f}** against a "
+                f"**${limit:.2f}** budget, and `override` is admin-only.\n"
+                f"Ask <@&{cfg.role_admin}>."
+            )
+        return  # allowed; commands/core.py is responsible for the audit line
+
+    raise Denied(
+        f"**${spend.stack_usd:.2f}** spent this month against a **${limit:.2f}** budget "
+        f"(100%).\n\n`/pz start` is paused for the player tier until the budget rolls "
+        f"over or is raised.\n\nAn admin can start it anyway with "
+        f"`/pz start override:true`, which is logged to the audit channel. The budget "
+        f"lives in `pzserver`'s `prod.tfvars` as `monthly_budget_usd`."
+    )
+
+
 def _name(interaction: discord.Interaction) -> str:
     command = interaction.command
     return getattr(command, "qualified_name", "").removeprefix("pz ") or "that"

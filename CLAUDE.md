@@ -85,6 +85,13 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   `INI_KEYS` and validates the value by that entry's own rule; labels are `[A-Za-z0-9_-]`
   and `shlex.quote`d. The IAM policy stops a chat message becoming arbitrary AWS actions;
   only this rule stops one becoming arbitrary *shell*.
+- **The budget gate fails OPEN, in three places, on purpose.** `guards.budget` lets
+  `/pz start` through when no budget is configured, when Cost Explorer is unreadable, and
+  when `stack_usd` is $0.00 while the account has spent something (the signature of the
+  `pz:stack` cost allocation tag not being activated — the figure is fictional, not zero).
+  The money guarantee is `pz-watchdog.sh` on the game server, which needs neither Discord
+  nor Cost Explorer; this layer is the polite early stop, not the backstop. Turning any of
+  these into a refusal converts an AWS hiccup into "nobody can play".
 - **The bot has no `ssm:PutParameter`**, deliberately (pzserver DESIGN §9). That is why
   `/pz idle` edits `/etc/pz/env` on the game server and lasts only until the next boot —
   it is not a shortcut, it is the only door. Permanent means `prod.tfvars` and an apply.
