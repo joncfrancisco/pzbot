@@ -18,14 +18,11 @@ so that no command can forget them:
 from __future__ import annotations
 
 import asyncio
-import base64
 import datetime as dt
 import enum
-import inspect
 import json
 import logging
 import re
-import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -36,10 +33,6 @@ from .config import Config
 from .rcon import Rcon, RconAuthError, RconUnreachable
 
 log = logging.getLogger(__name__)
-
-# Read once: this is the module in this repo, shipped to the game server verbatim so the
-# code that edits the world's rules is the code the tests here exercise.
-_SANDBOX_SOURCE = inspect.getsource(sandbox)
 
 Progress = Callable[[str], Awaitable[None]]
 
@@ -257,9 +250,10 @@ class GameServer:
             await asyncio.sleep(min(grace, 30))
 
         await progress("Saving and backing up\N{HORIZONTAL ELLIPSIS}")
-        result = await self.aws.run_shell(
+        result = await self.aws.send_command(
             self.cfg.game_instance_id,
-            ["/opt/pz/bin/pz-backup.sh prestop pzbot"],
+            self.cfg.document("backup"),
+            {"mode": "prestop", "label": ""},
             timeout=900,
             comment="pzbot /pz stop",
         )
@@ -308,9 +302,10 @@ class GameServer:
             await asyncio.sleep(30)
 
         await progress("Restarting the server (it saves on the way down)\N{HORIZONTAL ELLIPSIS}")
-        result = await self.aws.run_shell(
+        result = await self.aws.send_command(
             self.cfg.game_instance_id,
-            ["systemctl restart pzserver.service"],
+            self.cfg.document("lifecycle"),
+            {"action": "restart"},
             timeout=300,
             comment="pzbot /pz restart",
         )
@@ -381,12 +376,10 @@ class GameServer:
                 "The instance is stopped \N{EM DASH} there is nothing to back up live."
             )
 
-        argv = ["/opt/pz/bin/pz-backup.sh", "manual"]
-        if label:
-            argv.append(shlex.quote(label))
-        return await self.aws.run_shell(
+        return await self.aws.send_command(
             self.cfg.game_instance_id,
-            [" ".join(argv)],
+            self.cfg.document("backup"),
+            {"mode": "manual", "label": label},
             timeout=1800,
             comment="pzbot /pz backup now",
         )
@@ -423,9 +416,10 @@ class GameServer:
             )
 
         await progress("Stopping the game (it saves on the way down)\N{HORIZONTAL ELLIPSIS}")
-        stop = await self.aws.run_shell(
+        stop = await self.aws.send_command(
             self.cfg.game_instance_id,
-            ["systemctl stop pzserver.service"],
+            self.cfg.document("lifecycle"),
+            {"action": "stop"},
             timeout=300,
             comment="pzbot /pz restore (stop)",
         )
@@ -439,9 +433,10 @@ class GameServer:
             "Taking a prerestore backup and restoring\N{HORIZONTAL ELLIPSIS} "
             "(this can take a while)"
         )
-        result = await self.aws.run_shell(
+        result = await self.aws.send_command(
             self.cfg.game_instance_id,
-            [f"/opt/pz/bin/pz-restore.sh {shlex.quote(backup_name)} --yes"],
+            self.cfg.document("restore"),
+            {"backupName": backup_name},
             timeout=3600,
             comment="pzbot /pz restore",
         )
@@ -454,9 +449,10 @@ class GameServer:
             )
 
         await progress("Restored. Starting the game back up\N{HORIZONTAL ELLIPSIS}")
-        start = await self.aws.run_shell(
+        start = await self.aws.send_command(
             self.cfg.game_instance_id,
-            ["systemctl start pzserver.service"],
+            self.cfg.document("lifecycle"),
+            {"action": "start"},
             timeout=300,
             comment="pzbot /pz restore (start)",
         )
@@ -467,12 +463,12 @@ class GameServer:
             )
         return result
 
-    # --- Running our own code on the game server -------------------------------------
+    # --- Reaching the game server over SSM --------------------------------------------
 
     async def _require_instance_running(self, what: str) -> Snapshot:
         """SSM only reaches a running instance, and "InvalidInstanceId" explains nothing.
 
-        Every path that runs something on the game server goes through here, so the
+        Every path that sends a command to the game server goes through here, so the
         answer to "why did /pz config get just throw an AWS error" is a sentence about
         the server being off instead.
         """
@@ -484,30 +480,6 @@ class GameServer:
             )
         return snap
 
-    async def run_python(
-        self, source: str, args: list[str], *, comment: str, timeout: int = 120
-    ) -> CommandResult:
-        """Run a Python module of ours on the game server, over SSM.
-
-        The module is base64-encoded on the way, which is not obfuscation -- it is the
-        only way to put a multi-line program through a shell command string without
-        every quote and dollar sign in it becoming a bug. Arguments still go through
-        `shlex.quote`, and they have already been validated by an allowlist before they
-        get here.
-
-        The point of this over embedding a script inline: the code that runs on the box
-        is byte-for-byte the module that is unit-tested in this repo, instead of a second
-        implementation living in a string.
-        """
-        payload = base64.b64encode(source.encode("utf-8")).decode("ascii")
-        argv = " ".join(shlex.quote(arg) for arg in args)
-        return await self.aws.run_shell(
-            self.cfg.game_instance_id,
-            [f"echo {payload} | base64 -d | python3 - {argv}"],
-            timeout=timeout,
-            comment=comment,
-        )
-
     # --- Sandbox options (the world's rules) -----------------------------------------
 
     @property
@@ -517,9 +489,11 @@ class GameServer:
     async def sandbox_read(self) -> dict[str, str]:
         """Every sandbox value the world currently has, as raw Lua literals."""
         await self._require_instance_running("the world's settings file")
-        result = await self.run_python(
-            _SANDBOX_SOURCE,
-            ["get", self.sandbox_path],
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("sandbox"),
+            {"action": "get", "path": self.sandbox_path},
+            timeout=60,
             comment="pzbot /pz sandbox get",
         )
         if not result.ok:
@@ -563,9 +537,10 @@ class GameServer:
                 )
                 await asyncio.sleep(30)
             await progress("Stopping the game (it saves on the way down)\N{HORIZONTAL ELLIPSIS}")
-            stop = await self.aws.run_shell(
+            stop = await self.aws.send_command(
                 self.cfg.game_instance_id,
-                ["systemctl stop pzserver.service"],
+                self.cfg.document("lifecycle"),
+                {"action": "stop"},
                 timeout=300,
                 comment="pzbot /pz sandbox set (stop)",
             )
@@ -575,9 +550,11 @@ class GameServer:
                     f"```\n{stop.output[-1000:]}\n```"
                 )
 
-        result = await self.run_python(
-            _SANDBOX_SOURCE,
-            ["set", self.sandbox_path, path, literal],
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("sandbox"),
+            {"action": "set", "path": self.sandbox_path, "key": path, "value": literal},
+            timeout=60,
             comment="pzbot /pz sandbox set",
         )
         if not result.ok:
@@ -588,9 +565,10 @@ class GameServer:
                 await progress(
                     "The edit failed. Starting the server back up unchanged\N{HORIZONTAL ELLIPSIS}"
                 )
-                await self.aws.run_shell(
+                await self.aws.send_command(
                     self.cfg.game_instance_id,
-                    ["systemctl start pzserver.service"],
+                    self.cfg.document("lifecycle"),
+                    {"action": "start"},
                     timeout=300,
                     comment="pzbot /pz sandbox set (recover)",
                 )
@@ -605,9 +583,10 @@ class GameServer:
 
         if apply and game_was_up:
             await progress("Starting back up on the new settings\N{HORIZONTAL ELLIPSIS}")
-            start = await self.aws.run_shell(
+            start = await self.aws.send_command(
                 self.cfg.game_instance_id,
-                ["systemctl start pzserver.service"],
+                self.cfg.document("lifecycle"),
+                {"action": "start"},
                 timeout=300,
                 comment="pzbot /pz sandbox set (start)",
             )
@@ -639,10 +618,10 @@ class GameServer:
 
     async def ini_read(self) -> dict[str, str]:
         await self._require_instance_running("the server's .ini")
-        keys = "|".join(INI_KEYS)
-        result = await self.aws.run_shell(
+        result = await self.aws.send_command(
             self.cfg.game_instance_id,
-            [f"grep -E '^({keys})=' {shlex.quote(self.ini_path)} || true"],
+            self.cfg.document("config-read"),
+            {},
             timeout=60,
             comment="pzbot /pz config get",
         )
@@ -670,12 +649,11 @@ class GameServer:
 
         snap = await self._require_instance_running("the server's .ini")
 
-        # Shipped and run the same way as the sandbox editor, rather than embedded in a
-        # shell string: the key and the value arrive as argv, so no amount of quoting in
-        # either can become shell syntax.
-        result = await self.run_python(
-            _INI_SCRIPT,
-            [self.ini_path, key, value],
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("config-write"),
+            {"key": key, "value": value},
+            timeout=60,
             comment="pzbot /pz config set",
         )
         if not result.ok:
@@ -708,17 +686,10 @@ class GameServer:
             raise OperationError("The idle timeout must be between 5 and 1440 minutes.")
         warn_min = max(1, min(warn_min, timeout_min - 1))
 
-        result = await self.aws.run_shell(
+        result = await self.aws.send_command(
             self.cfg.game_instance_id,
-            [
-                "set -e",
-                f"sed -i -E 's/^PZ_IDLE_TIMEOUT_MIN=.*/PZ_IDLE_TIMEOUT_MIN={timeout_min}/' "
-                "/etc/pz/env",
-                f"sed -i -E 's/^PZ_IDLE_WARN_MIN=.*/PZ_IDLE_WARN_MIN={warn_min}/' /etc/pz/env",
-                # Clear the "already warned" flag so the new threshold gets its own warning.
-                "rm -f /var/lib/pz/idle-warned /var/lib/pz/idle-minutes",
-                "grep -E '^PZ_IDLE' /etc/pz/env",
-            ],
+            self.cfg.document("idle-retune"),
+            {"timeoutMin": str(timeout_min), "warnMin": str(warn_min)},
             timeout=60,
             comment="pzbot /pz idle",
         )
@@ -727,29 +698,6 @@ class GameServer:
                 f"Could not retune the watchdog:\n```\n{result.output[-800:]}\n```"
             )
         return result.stdout.strip()
-
-
-# Run on the game server by `ini_write`. Plain argv in, one line changed, nothing else
-# touched -- the same contract as the sandbox editor, for the same reason.
-_INI_SCRIPT = """
-import sys
-
-path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
-lines = open(path, encoding="utf-8").read().splitlines()
-
-out, found = [], False
-for line in lines:
-    if line.split("=", 1)[0].strip() == key:
-        out.append(key + "=" + value)
-        found = True
-    else:
-        out.append(line)
-if not found:
-    out.append(key + "=" + value)
-
-open(path, "w", encoding="utf-8").write("\\n".join(out) + "\\n")
-print(("updated " if found else "added ") + key)
-"""
 
 
 @dataclass(frozen=True)

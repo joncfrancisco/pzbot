@@ -191,27 +191,29 @@ class Aws:
 
     # --- Run Command -----------------------------------------------------------------
 
-    async def run_shell(
+    async def send_command(
         self,
         instance_id: str,
-        commands: list[str],
+        document: str,
+        parameters: dict[str, str],
         *,
         timeout: int = 600,
         comment: str = "pzbot",
     ) -> CommandResult:
-        """Run a command on the game server and wait for it.
+        """Run one of pzserver's scoped SSM documents on the game server, and wait for it.
 
-        Callers pass fixed command strings that invoke the `/opt/pz/bin` scripts. Nothing
-        in this file interpolates user input into a shell command, and nothing should:
-        the IAM policy stops a Discord message becoming arbitrary AWS actions, but only
-        this rule stops one becoming arbitrary *shell*.
+        Callers pass a document name and typed parameters; nothing here builds a shell
+        string. The document is the allowlist -- its `allowedPattern`/`allowedValues`
+        constrain each parameter at the AWS layer, not by convention in this file
+        (pzserver issue #29). `timeout` bounds how long this method polls for a result;
+        the document's own step has its own fixed `timeoutSeconds` on the pzserver side.
         """
 
         def send() -> str:
             resp = self._ssm.send_command(
                 InstanceIds=[instance_id],
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": commands, "executionTimeout": [str(timeout)]},
+                DocumentName=document,
+                Parameters={k: [v] for k, v in parameters.items()},
                 Comment=comment[:100],
             )
             return resp["Command"]["CommandId"]

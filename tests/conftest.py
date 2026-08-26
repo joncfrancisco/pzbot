@@ -21,10 +21,10 @@ class FakeAws:
     def __init__(self, state: str = "stopped") -> None:
         self.state = state
         self.calls: list[str] = []
-        self.shell: list[list[str]] = []
-        self.python: list[str] = []
-        self.shell_result = CommandResult("Success", "done", "")
-        self.python_result = CommandResult(
+        # Each entry is (document_name, parameters) for one send_command call.
+        self.commands: list[tuple[str, dict[str, str]]] = []
+        self.command_result = CommandResult("Success", "done", "")
+        self.sandbox_result = CommandResult(
             "Success", json.dumps({"setting": "?", "was": "1", "now": "2"}), ""
         )
         self.backups: list[Backup] = []
@@ -61,16 +61,14 @@ class FakeAws:
         self.state = "stopped"
         return "stopping"
 
-    async def run_shell(self, instance_id, commands, *, timeout=600, comment="") -> CommandResult:
-        self.calls.append(f"shell:{comment}")
-        self.shell.append(commands)
-        # `run_python` ships a module as base64 and runs it. Those calls answer with JSON
-        # on stdout, so they get their own canned result -- the argv is still visible at
-        # the end of the command string for tests to assert on.
-        if "base64 -d" in commands[0]:
-            self.python.append(commands[0])
-            return self.python_result
-        return self.shell_result
+    async def send_command(
+        self, instance_id, document, parameters, *, timeout=600, comment=""
+    ) -> CommandResult:
+        self.calls.append(f"cmd:{comment}")
+        self.commands.append((document, dict(parameters)))
+        if document.endswith("-sandbox"):
+            return self.sandbox_result
+        return self.command_result
 
     async def list_backups(self, bucket, stack, limit=200) -> list[Backup]:
         self.calls.append(f"list_backups:{bucket}")
