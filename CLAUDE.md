@@ -20,7 +20,7 @@ systemd on AL2023 arm64. No web framework, no database, no state on disk.
 ```bash
 pip install -e '.[dev]'
 ruff check src tests && ruff format --check src tests
-pytest -q                      # 133 tests, no network, ~2s
+pytest -q                      # 138 tests, no network, ~2s
 ```
 
 There is no Python 3.12 on this Mac (system Python is 3.9, and there is no Homebrew).
@@ -41,8 +41,10 @@ user's go-ahead.
 src/pzbot/
   server.py      ← THE state machine + every operation. No Discord types in it.
   rcon.py        ← vendored async Source RCON; typed failures
-  sandbox.py     ← SandboxVars.lua: the settings table, the Lua reader/writer, AND the
-                   script that runs on the game server (shipped by run_python)
+  sandbox.py     ← SandboxVars.lua: the settings table and the Lua reader/writer. A
+                   second copy of this file's remote half lives in pzserver as
+                   ops/bin/pz-sandbox-tool.py, invoked by the `pz-<stack>-sandbox` SSM
+                   document -- kept in sync by hand until that duplication is resolved.
   aws.py         ← one method per statement in pz-bot-role
   config.py      ← env > bot_contract.json > Parameter Store > tag discovery
   guards.py      ← guild / channel / role gates (the real permission model)
@@ -86,9 +88,10 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   dies halfway leaves an `m7i.xlarge` billing at $0.20/hour with nobody watching.
 - **Nothing user-supplied reaches a shell.** `/pz restore` validates the name against a
   regex *and* against the live S3 listing; `/pz config set` looks the key up in
-  `INI_KEYS` and validates the value by that entry's own rule; labels are `[A-Za-z0-9_-]`
-  and `shlex.quote`d. The IAM policy stops a chat message becoming arbitrary AWS actions;
-  only this rule stops one becoming arbitrary *shell*.
+  `INI_KEYS` and validates the value by that entry's own rule. `Aws.send_command` never
+  builds a shell string at all — every call names one of pzserver's scoped SSM documents
+  (issue #29) and passes typed parameters, so the document's own `allowedPattern` /
+  `allowedValues` re-check everything at the AWS layer, not just here.
 - **The budget gate fails OPEN, in three places, on purpose.** `guards.budget` lets
   `/pz start` through when no budget is configured, when Cost Explorer is unreadable, and
   when `stack_usd` is $0.00 while the account has spent something (the signature of the
@@ -127,11 +130,11 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   label (`2 (Saliva only)`) and prints `(not a known option)` for a number outside our
   table, so a build that reorders an option list shows up as a visible mismatch rather
   than a mislabelled setting. If one ever looks wrong, the in-game screen is the truth.
-- **`run_python` ships a real module, not a script in a string.** `sandbox.py` is
-  base64-encoded and piped to `python3 -` on the game server, so the code that edits the
-  world is the code the tests exercise — and base64 means no quoting in a value can ever
-  become shell syntax. `tests/test_remote_scripts.py` drives the exact command string
-  through a real shell.
+- **Document names are a convention, not published config.** `Config.document()` builds
+  `pz-<stack>-<suffix>` to match pzserver's own `local.name_prefix`, the same way
+  `ssm_prefix` mirrors pzserver's parameter tree. Renaming a document on either side
+  without the other is a silent break — SSM's error for an unknown document name does
+  not mention this convention at all.
 - **`deploy/install.sh` must stay idempotent** — it is the upgrade path, and it runs as
   root on the only host that can reach the game server.
 - **Never hand-edit `requirements.txt`.** It is a `pip-compile` lockfile and the installer

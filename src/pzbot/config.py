@@ -135,6 +135,15 @@ class Config:
     def ssm(self, suffix: str) -> str:
         return f"{self.ssm_prefix}/{suffix}"
 
+    def document(self, suffix: str) -> str:
+        """Name of one of pzserver's scoped SSM documents (issue #29).
+
+        Mirrors pzserver's own `local.name_prefix = "pz-${var.stack}"` -- the two
+        repos must agree on this without either publishing it to the other, the same
+        way `ssm_prefix` already does above.
+        """
+        return f"pz-{self.stack}-{suffix}"
+
 
 def _contract_from_disk() -> dict:
     path = os.environ.get("PZBOT_CONTRACT", "/etc/pzbot/bot_contract.json")
