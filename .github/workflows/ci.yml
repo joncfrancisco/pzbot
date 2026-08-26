@@ -1,5 +1,8 @@
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -10,8 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           # The bot host runs 3.12 (AL2023's python3.12 package). Testing on anything
           # else tests something nobody deploys.
@@ -29,7 +32,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Shellcheck the installer
         # It runs as root on the only host that can reach the game server. Worth linting.
         run: shellcheck deploy/install.sh
@@ -37,8 +40,8 @@ jobs:
   lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           # Must match the host: pip-compile resolves for the interpreter it runs on, so
           # compiling under a different minor can pin a different dependency set.
