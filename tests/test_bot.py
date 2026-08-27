@@ -111,8 +111,25 @@ async def test_the_heartbeat_is_published_even_when_the_probe_fails(heartbeat_bo
     # AwsError is a tuple of exception classes for `except`, not something you raise --
     # so this uses a real ClientError, the same one the error-handler tests use.
     heartbeat_bot._update_presence.side_effect = client_error()
-    with pytest.raises(ClientError):
-        await PzBot.presence.coro(heartbeat_bot)
+    await PzBot.presence.coro(heartbeat_bot)
+    assert "heartbeat" in aws.calls
+
+
+@pytest.mark.parametrize(
+    "escaping",
+    [
+        client_error(),
+        OperationError("the game server no longer exists"),
+        RuntimeError("a `players` response the parser did not like"),
+    ],
+)
+async def test_a_failed_probe_does_not_kill_the_presence_loop(heartbeat_bot, aws, escaping):
+    # `tasks.loop` stops permanently on an unhandled exception and nothing restarts it,
+    # so anything escaping the probe is worse than the thing that escaped: presence
+    # freezes on a stale reading and the heartbeat stops for good -- which then trips the
+    # alarm built to catch "healthy host, dead bot" because its own publisher was killed.
+    heartbeat_bot._update_presence.side_effect = escaping
+    await PzBot.presence.coro(heartbeat_bot)  # must not raise
     assert "heartbeat" in aws.calls
 
 

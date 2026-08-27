@@ -25,6 +25,20 @@ log = logging.getLogger(__name__)
 
 AwsError = (ClientError, BotoCoreError)
 
+# What EC2 answers when an instance id no longer names an instance -- the state a
+# rebuilt game server leaves the bot's pinned id in once the terminated one ages out
+# of DescribeInstances. Named because `server.probe` has to tell it apart from every
+# other AWS failure: this one is recoverable by re-resolving the tag, and nothing else is.
+INSTANCE_GONE = "InvalidInstanceID.NotFound"
+
+
+def is_instance_gone(exc: BaseException) -> bool:
+    """True for the one AWS error that means "re-discover me", not "AWS is unhappy"."""
+    return (
+        isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") == INSTANCE_GONE
+    )
+
+
 # Short timeouts with retries, rather than long ones: a wedged API call must surface as
 # an error inside an interaction's lifetime, not hang a progress embed for a minute.
 _BOTO = BotoConfig(
@@ -160,7 +174,24 @@ class Aws:
     async def describe(self, instance_id: str) -> Instance:
         def call() -> Instance:
             resp = self._ec2.describe_instances(InstanceIds=[instance_id])
-            raw = resp["Reservations"][0]["Instances"][0]
+            found = [i for r in resp["Reservations"] for i in r["Instances"]]
+            if not found:
+                # EC2 rejects a genuinely unknown id with InvalidInstanceID.NotFound, but
+                # an instance terminated moments ago can come back as an empty result
+                # instead. Both mean the same thing, so both raise the same error: an
+                # IndexError here is not an `AwsError`, so it would escape the presence
+                # loop (killing it) and `/pz start`'s `except AwsError` budget gate
+                # (turning a fail-open into a refusal) rather than being handled.
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": INSTANCE_GONE,
+                            "Message": f"The instance ID '{instance_id}' does not exist",
+                        }
+                    },
+                    "DescribeInstances",
+                )
+            raw = found[0]
             return Instance(
                 instance_id=raw["InstanceId"],
                 state=raw["State"]["Name"],
