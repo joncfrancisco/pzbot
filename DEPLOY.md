@@ -156,6 +156,53 @@ proves the event loop is alive end to end:
 aws cloudwatch list-metrics --namespace PZ --metric-name BotAlive
 ```
 
+## When the bot host stops answering
+
+The failure to know by heart, because it locks you out of the box while looking like a
+healthy instance. Symptoms, all at once:
+
+- `aws ssm describe-instance-information` → **`ConnectionLost`**, and `send-command`
+  returns `Failed` / `Undeliverable` with empty stdout *and* empty stderr.
+- `AWS/EC2 NetworkOut` → **exactly `0`**, not merely low.
+- `describe-instance-status` → both checks **`ok`**, state `running`. The hypervisor is
+  happy; it cannot see that userspace is gone.
+- `PZ/BotAlive` stops, so `pz-prod-bot-heartbeat-missing` fires — but *only* that alarm.
+
+**Cause.** 414 MB of usable RAM, and two things that both want a lot of it. pzbot sits at
+a steady ~97 MB (measured over five minutes — it does not leak). SSM Patch Manager's
+daily `dnf` scan peaks around **163 MB**. Add the ~90 MB base system and the box is over.
+The kernel fires a *global* OOM — so `MemoryMax=320M` never applies, pzbot being nowhere
+near it — and kills pzbot as the largest anonymous consumer. systemd restarts it, the
+kernel kills it again, and the thrashing starves the SSM agent until nothing answers.
+
+`deploy/pzbot.service` now sets `OOMScoreAdjust=-900` so the kernel takes `dnf` instead.
+
+**Recovery.** There is no SSH, and the agent is the thing that died, so the only lever is
+EC2 itself:
+
+```bash
+aws ec2 stop-instances  --instance-ids i-09158ffe716ee3c5e   # ~4.5 min; AWS force-stops it
+aws ec2 start-instances --instance-ids i-09158ffe716ee3c5e
+```
+
+Both hosts hold Elastic IPs, so a stop/start does not re-address anything.
+
+If it wedges again within minutes of booting, **win the race**: poll for `PingStatus`
+`Online` and immediately `systemctl stop pzbot && systemctl disable pzbot`. That leaves a
+stable box to work on. Let the boot-time `dnf` finish (watch `pgrep -x dnf`) before
+running `install.sh`, which runs `dnf` and `pip` of its own.
+
+**Do not** debug this with `journalctl -b -1 | grep` over a whole boot — on this box that
+is itself enough memory and I/O to re-wedge it. Write findings to a file from a detached
+script and read the file afterwards.
+
+**Still open.** The daily patch association is `AWS-QuickSetup-SSMHostMgmt-ScanForPatches-l78ve`,
+targeting `InstanceIds: *`, created by AWS Quick Setup rather than pzserver's Terraform.
+`ssm update-association` refuses it — every form returns `InvalidParameters: Parameter
+"AssociationId" requires a value` — so it cannot be rescheduled or narrowed from the CLI.
+Until it is changed in the Quick Setup console (or the host is resized past `t4g.nano`),
+`OOMScoreAdjust` is what stands between the nightly scan and another outage.
+
 ## Changing the world's rules
 
 Two files, two commands, and the difference is which one needs a restart.
@@ -239,6 +286,7 @@ recognise here.
 | `/pz` works nowhere | `channel_main` does not include the channel you are in. |
 | Status says **Unknown**, "authentication failed" | The bot's RCON password is stale. Restart it (above). |
 | Every command errors, but `systemctl is-active` says `active` and `BotAlive` is ticking | The game server was replaced and the bot is holding the old instance id. Fixed in #17 — the bot re-resolves the tag within one presence cycle. On an older build, `systemctl restart pzbot`. Confirm with `journalctl -u pzbot \| grep "game server was replaced"`. |
+| Host answers nothing at all: SSM `ConnectionLost`, `NetworkOut` flat 0, but EC2 status checks both `ok` | The box is OOM-wedged. See [When the bot host stops answering](#when-the-bot-host-stops-answering). Only an EC2 stop/start gets back in. |
 | Status sits on **Loading the world** for 10+ minutes | PZ itself. `journalctl -u pzserver` on the *game* server. The bot stops the instance rather than let it bill. |
 | `/pz cost` shows `$0.00` next to a real account total | The `pz:stack` cost allocation tag was never activated — pzserver `DEPLOY.md` step 1. |
 | Everything is slow, memory climbs | `MemoryMax=320M` in the unit will restart it. The box has 512 MB total. |
@@ -263,3 +311,28 @@ systemctl daemon-reload
 ```
 
 The host itself belongs to pzserver's Terraform; leave it alone.
+
+---
+
+## Notes
+
+**2026-08-27 — upgrade to `66eb6ae` (#18), during the outage above.**
+
+- Two AWS read paths lie about patching, and both cost time here. `describe-association-executions`
+  records an execution only on the *schedule*, so a `dnf` the agent runs at boot appears
+  nowhere in it — the process table is the truth (`ps -eo rss,comm --sort=-rss`). And a
+  single stuck command showing `InProgress` for hours is a *symptom* of the dying box, not
+  the cause; cancelling it changes nothing on its own.
+- Before deploying anything that touches SSM, check the cross-repo half first. The scoped
+  documents from #12 need all seven `pz-prod-{backup,restore,lifecycle,config-read,config-write,sandbox,idle-retune}`
+  to exist *and* be listed in `pz-prod-bot-role`, and they invoke `/opt/pz/bin/pz-*-tool.py`
+  on the *game* server. On 2026-08-26 the documents existed before those scripts did, and
+  `/pz config set` failed with a bare `No such file or directory` that named neither repo.
+- `install.sh` re-enables the unit (`systemctl enable`), so a deliberately disabled pzbot
+  comes back on the next upgrade. Expected, but surprising mid-incident.
+- **Unrelated finding, worth fixing.** `pz-prod-gameserver-role` grants `ssm:GetParameter*`
+  on `arn:...:parameter/pz/prod/*` — the whole tree, not the game server's own subtree.
+  The game server does a recursive fetch at boot and decrypts *everything*, including
+  `/pz/prod/discord/token`, `admin_password` and `alert_webhook` (visible as KMS `Decrypt`
+  calls in CloudTrail under the instance role). The Discord bot token therefore lands on
+  the box players connect to. That is pzserver's IAM to narrow.
