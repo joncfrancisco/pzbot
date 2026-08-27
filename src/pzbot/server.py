@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from . import rcon as rcon_mod
 from . import sandbox
-from .aws import Aws, CommandResult, Instance
+from .aws import Aws, AwsError, CommandResult, Instance, is_instance_gone
 from .config import Config
 from .rcon import Rcon, RconAuthError, RconUnreachable
 
@@ -108,9 +108,64 @@ class GameServer:
 
     # --- Observation -----------------------------------------------------------------
 
+    async def _describe_game(self) -> Instance:
+        """Describe the game server, following it if the instance itself was replaced.
+
+        `config.load` discovers the instance by tag and its docstring promises that "if
+        the instance is ever rebuilt, the bot follows it without a redeploy". It did not:
+        the id was resolved once at startup and pinned for the life of the process, so a
+        `terraform apply` that replaced the instance left every command -- `/pz status`
+        and `/pz start` included -- pointed at the corpse of the old one. Nothing
+        detected it either: `systemctl is-active` said active and the `PZ/BotAlive`
+        heartbeat kept ticking, because neither of those looks at the game server at all.
+
+        `probe()` a few lines below already re-follows the private IP for exactly this
+        reason. The instance id is the other half of the same rebuild.
+
+        Re-resolution goes through the same `pz:stack` + `pz:role=gameserver` tag pair
+        that `pz-bot-role` is scoped by, so this can never follow the bot onto a box its
+        own credentials cannot touch.
+        """
+        # Annotated `Exception`, not `AwsError`: that name is a *tuple* of classes for
+        # `except` to unpack, and using it as a type is the same confusion that once took
+        # down the error handler itself (`case AwsError():` -- see bot.py).
+        gone: Exception | None = None
+        try:
+            instance = await self.aws.describe(self.cfg.game_instance_id)
+        except AwsError as exc:
+            # Every other AWS failure is somebody else's problem to report. This one is
+            # the recoverable one, and only this one.
+            if not is_instance_gone(exc):
+                raise
+            gone = exc
+        else:
+            # A terminated instance still answers DescribeInstances for about an hour
+            # after a rebuild, so "gone" has two shapes and this is the earlier one.
+            if instance.state != "terminated":
+                return instance
+
+        replacement = await self.aws.find_instance(stack=self.cfg.stack, role="gameserver")
+        if not replacement or replacement == self.cfg.game_instance_id:
+            if gone is None:
+                return instance  # terminated, and nothing has taken its place yet
+            raise OperationError(
+                f"The game server `{self.cfg.game_instance_id}` no longer exists, and "
+                f"nothing is tagged `pz:stack={self.cfg.stack}` `pz:role=gameserver` in "
+                f"{self.cfg.region} to take its place. Either the stack is mid-apply or "
+                "it has not been applied \N{EM DASH} check `terraform plan` in pzserver."
+            )
+
+        log.warning(
+            "game server was replaced: %s is gone, following the tag to %s",
+            self.cfg.game_instance_id,
+            replacement,
+        )
+        self.cfg.game_instance_id = replacement
+        return await self.aws.describe(replacement)
+
     async def probe(self, *, rcon_timeout: float = 6.0) -> Snapshot:
         """Live state. Never cached, never inferred from a previous call."""
-        instance = await self.aws.describe(self.cfg.game_instance_id)
+        instance = await self._describe_game()
         if not instance.is_running:
             return Snapshot(instance, _stage_for(instance, False), [], 0)
 

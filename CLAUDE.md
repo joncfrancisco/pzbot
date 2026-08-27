@@ -22,7 +22,7 @@ systemd on AL2023 arm64. No web framework, no database, no state on disk.
 ```bash
 pip install -e '.[dev]'
 ruff check src tests && ruff format --check src tests
-pytest -q                      # 138 tests, no network, ~2s
+pytest -q                      # 154 tests, no network, ~2s
 ```
 
 There is no Python 3.12 on this Mac (system Python is 3.9, and there is no Homebrew).
@@ -110,7 +110,17 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   watchdog compares `idle >= timeout` and would stop the box on the first tick.
 - **The game instance id is discovered by tag, never configured.** The IAM policy is
   scoped by `pz:stack` + `pz:role=gameserver`; following anything else would point the
-  bot at an instance its own credentials cannot touch.
+  bot at an instance its own credentials cannot touch. `config.load` resolves it at
+  startup and `server._describe_game` re-resolves it whenever the pinned id stops
+  existing, so a `terraform apply` that *replaces* the game server is followed without a
+  redeploy. That second half was missing until #17 and it is the whole failure: the id
+  was pinned for the life of the process, so a rebuild left every command aimed at the
+  corpse — while `systemctl is-active` and `PZ/BotAlive` both stayed green, because
+  neither of them looks at the game server at all.
+- **Nothing may escape the presence loop.** `tasks.loop` stops permanently on an
+  unhandled exception and nothing restarts it, so an escape takes the heartbeat down
+  with it — and the alarm built to catch "healthy host, dead bot" then fires because its
+  own publisher died. `bot.presence` swallows and logs; `_heartbeat` already did.
 - **Commands are registered to one guild.** Instant sync, and they exist nowhere else —
   which is a real mitigation if the token ever leaks, alongside the guild check in
   `guards.py`.

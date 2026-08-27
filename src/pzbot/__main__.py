@@ -19,7 +19,7 @@ import sys
 import discord
 
 from . import config as config_mod
-from .aws import Aws
+from .aws import Aws, AwsError
 from .bot import PzBot
 
 EX_CONFIG = 78
@@ -48,6 +48,14 @@ async def _run() -> int:
     except config_mod.ConfigError as exc:
         log.error("cannot start:\n%s", exc)
         return EX_CONFIG
+    except AwsError as exc:
+        # Deliberately NOT EX_CONFIG: an AccessDenied or a throttle on the way in is
+        # usually a stack mid-`terraform apply` or IMDS not up yet on a fresh boot, and
+        # the right answer is the ten-second retry systemd already does. What this adds
+        # is the log line -- without it the botocore exception escapes `asyncio.run` as a
+        # bare traceback, and which call failed for which principal is buried in it.
+        log.error("cannot read this stack's configuration from AWS: %s", exc)
+        return 1
 
     log.info(
         "stack=%s region=%s game=%s rcon=%s:%s connect=%s",

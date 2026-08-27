@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from botocore.exceptions import ClientError
 
 from conftest import FakeRcon, backup, noop_progress
 from pzbot.rcon import RconAuthError, RconUnreachable
@@ -78,6 +79,81 @@ async def test_probe_follows_a_moved_private_ip(server, aws):
     server.rcon.host = "10.20.1.9"  # stale, e.g. after the instance was rebuilt
     await server.probe()
     assert server.rcon.host == "10.20.1.171"
+
+
+# --- A rebuilt game server ---------------------------------------------------------------
+#
+# The instance id is discovered by tag at startup and was then pinned for the life of the
+# process, so a `terraform apply` that replaced the game server left every command aimed
+# at the corpse of the old one -- with nothing to detect it, because `systemctl is-active`
+# and the BotAlive heartbeat both stay green while the bot cannot see its own server.
+
+
+async def test_a_healthy_instance_is_never_re_resolved(server, aws):
+    # Re-resolving is the recovery path, not the normal one: an extra DescribeInstances
+    # on every probe would double the cost of the loop that runs sixty times an hour.
+    aws.state = "running"
+    await server.probe()
+    assert not [c for c in aws.calls if c.startswith("find:")]
+
+
+async def test_a_vanished_instance_is_followed_to_its_replacement(server, aws, cfg):
+    aws.gone.add("i-0test")  # EC2 no longer knows the id the bot booted with
+    aws.instance_id = "i-0rebuilt"  # ...but the tag resolves to the new one
+    aws.state = "stopped"
+
+    snap = await server.probe()
+
+    assert snap.instance.instance_id == "i-0rebuilt"
+    assert cfg.game_instance_id == "i-0rebuilt", "the id must stick, not be re-derived"
+
+
+async def test_a_terminated_instance_is_followed_before_it_ages_out(server, aws, cfg):
+    # For about an hour after a rebuild the old instance still answers DescribeInstances,
+    # as `terminated`. That renders as Stage.UNKNOWN -- indistinguishable, to whoever
+    # typed `/pz status`, from a bot that is simply broken.
+    aws.states["i-0test"] = "terminated"
+    aws.instance_id = "i-0rebuilt"
+    aws.state = "running"
+
+    snap = await server.probe()
+
+    assert cfg.game_instance_id == "i-0rebuilt"
+    assert snap.stage is Stage.READY
+
+
+async def test_a_vanished_instance_with_no_replacement_says_so(server, aws):
+    # Mid-apply, or a stack that was destroyed. The failure has to name itself: this used
+    # to surface as a bare botocore AccessDenied-shaped embed with no hint that the id
+    # the bot was holding had simply stopped existing.
+    aws.gone.add("i-0test")
+    aws.instance_id = ""
+
+    with pytest.raises(OperationError, match="no longer exists"):
+        await server.probe()
+
+
+async def test_a_terminated_instance_with_no_replacement_is_reported_not_hidden(server, aws):
+    # Nothing has taken its place yet, so there is nothing to follow -- report the state
+    # EC2 gave rather than inventing an error.
+    aws.states["i-0test"] = "terminated"
+    aws.instance_id = ""
+
+    assert (await server.probe()).stage is Stage.UNKNOWN
+
+
+async def test_an_ordinary_aws_failure_is_not_treated_as_a_rebuild(server, aws):
+    # Only InvalidInstanceID.NotFound means "re-discover me". A throttle or an
+    # AccessDenied must propagate to the one error handler, not silently repoint the bot.
+    boom = ClientError({"Error": {"Code": "RequestLimitExceeded", "Message": "slow down"}}, "D")
+
+    async def describe(instance_id):
+        raise boom
+
+    aws.describe = describe
+    with pytest.raises(ClientError):
+        await server.probe()
+    assert not [c for c in aws.calls if c.startswith("find:")]
 
 
 # --- Start -----------------------------------------------------------------------------

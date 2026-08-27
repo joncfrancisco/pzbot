@@ -238,6 +238,7 @@ recognise here.
 | Every command says "not configured for this server" | `guild_id` does not match the guild the command came from. |
 | `/pz` works nowhere | `channel_main` does not include the channel you are in. |
 | Status says **Unknown**, "authentication failed" | The bot's RCON password is stale. Restart it (above). |
+| Every command errors, but `systemctl is-active` says `active` and `BotAlive` is ticking | The game server was replaced and the bot is holding the old instance id. Fixed in #17 — the bot re-resolves the tag within one presence cycle. On an older build, `systemctl restart pzbot`. Confirm with `journalctl -u pzbot \| grep "game server was replaced"`. |
 | Status sits on **Loading the world** for 10+ minutes | PZ itself. `journalctl -u pzserver` on the *game* server. The bot stops the instance rather than let it bill. |
 | `/pz cost` shows `$0.00` next to a real account total | The `pz:stack` cost allocation tag was never activated — pzserver `DEPLOY.md` step 1. |
 | Everything is slow, memory climbs | `MemoryMax=320M` in the unit will restart it. The box has 512 MB total. |

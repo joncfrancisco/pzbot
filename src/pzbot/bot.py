@@ -78,6 +78,15 @@ class PzBot(discord.Client):
         """
         try:
             await self._update_presence()
+        except Exception:  # noqa: BLE001 -- see below; this loop may never die
+            # `tasks.loop` stops permanently on an unhandled exception, and nothing
+            # restarts it. That makes any escape from here strictly worse than the thing
+            # that escaped: presence freezes on a stale reading AND the heartbeat below
+            # stops forever, so the one alarm built to catch "healthy host, dead bot"
+            # fires because its own publisher was killed by a `players` response the RCON
+            # parser did not like. `_heartbeat` is already written this way and says so;
+            # the probe is the larger surface and needs the same rule.
+            log.exception("presence update failed")
         finally:
             # In a `finally`, and therefore published even when the probe above failed.
             # The heartbeat's claim is "this event loop completed a cycle", not "AWS is
@@ -103,7 +112,10 @@ class PzBot(discord.Client):
     async def _update_presence(self) -> None:
         try:
             snap = await self.ctx.server.probe(rcon_timeout=4.0)
-        except AwsError:
+        except (AwsError, OperationError):
+            # A stopped stack, a mid-apply AccessDenied, a game server that no longer
+            # exists: all of them are things to say in the log and re-check in sixty
+            # seconds, not reasons to stop watching.
             log.warning("presence probe failed", exc_info=True)
             return
 

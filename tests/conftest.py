@@ -6,8 +6,9 @@ import datetime as dt
 import json
 
 import pytest
+from botocore.exceptions import ClientError
 
-from pzbot.aws import Backup, CommandResult, Cost, Instance
+from pzbot.aws import INSTANCE_GONE, Backup, CommandResult, Cost, Instance
 from pzbot.config import Config, Runtime
 from pzbot.rcon import RconUnreachable
 from pzbot.server import GameServer
@@ -29,15 +30,28 @@ class FakeAws:
         )
         self.backups: list[Backup] = []
         self.parameters: dict[str, str] = {}
+        # What `find_instance` resolves the pz:role=gameserver tag to. "" means nothing
+        # in the account carries the tag.
         self.instance_id = "i-0test"
+        # Instance ids EC2 no longer knows about -- a game server that was rebuilt and
+        # has since aged out of DescribeInstances.
+        self.gone: set[str] = set()
+        # Per-id state, for the window where a rebuilt instance still answers as
+        # `terminated`. Falls back to `self.state`.
+        self.states: dict[str, str] = {}
         # Set to an exception to simulate PutMetricData failing.
         self.heartbeat_fails: Exception | None = None
 
     async def describe(self, instance_id: str) -> Instance:
         self.calls.append(f"describe:{instance_id}")
+        if instance_id in self.gone:
+            raise ClientError(
+                {"Error": {"Code": INSTANCE_GONE, "Message": "does not exist"}},
+                "DescribeInstances",
+            )
         return Instance(
             instance_id=instance_id,
-            state=self.state,
+            state=self.states.get(instance_id, self.state),
             private_ip="10.20.1.171",
             public_ip="34.233.59.251",
             launch_time=dt.datetime.now(dt.UTC) - dt.timedelta(minutes=30),
