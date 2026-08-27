@@ -24,11 +24,24 @@ RestartSec=10
 # identical ones, so the unit stops and waits for a human instead.
 RestartPreventExitStatus=78
 
-# This box has 512 MB. discord.py + boto3 sits around 150 MB resident; the ceiling is
+# This box has 512 MB. discord.py + boto3 sits around 100 MB resident; the ceiling is
 # here so a leak takes the bot down and restarts it, rather than taking down sshd's
 # replacement (the SSM agent) and locking everyone out of the host.
 MemoryHigh=220M
 MemoryMax=320M
+
+# ...but the ceiling only catches a leak in *this* process, and the 2026-08-26 outage
+# came the other way round. SSM Patch Manager's daily dnf scan peaks near 163 MB; added
+# to pzbot's steady ~97 MB and the ~90 MB base system, that exceeds the 414 MB of usable
+# RAM. The kernel fired a *global* OOM -- nowhere near MemoryMax, so the limit above
+# never applied -- and picked pzbot as the victim because it was the largest anonymous
+# consumer. systemd restarted it, the kernel killed it again, and the thrashing starved
+# the SSM agent until the whole host stopped answering. With no SSH and no key pair, the
+# only way back in was an EC2 stop/start.
+#
+# So bias the kernel away from pzbot and toward dnf: a patch scan that dies is retried
+# tomorrow, whereas a bot that dies takes the only door into the box with it.
+OOMScoreAdjust=-900
 
 # The bot's whole job is to talk to two APIs. It has no reason to write to the disk, own
 # a privilege, or see anyone's home directory.
