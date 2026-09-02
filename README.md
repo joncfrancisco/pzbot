@@ -37,6 +37,15 @@ Discord ──▶ pzbot (t4g.nano, always on)
 | `/pz sandbox set` | **admin** | Change one of them. Both halves autocompleted; restarts to apply. |
 | `/pz idle <minutes\|off>` | **admin** | Retunes the idle shutdown for this session. |
 | `/pz cost` | player | Month-to-date spend and running hours. |
+| `/pz version status` | player | Which build is installed, and will it update itself. |
+| `/pz version hold\|unhold` | **admin** | Pin the build on disk, or resume updating. Survives a rebuild. |
+| `/pz version update` | **admin** | Back up → stop → SteamCMD → start. `validate:true` for a corrupt install. |
+| `/pz version branch <name>` | **admin** | Switch Steam branch. Two-step confirm — the save-breaking one. |
+| `/pz mods list` | player | Workshop items, and which mods each one contributes. |
+| `/pz mods add <id> [mod-ids]` | **admin** | Two-step confirm, `before-mods` backup, restart. |
+| `/pz mods remove <id>` | **admin** | Same, autocompleted from what is installed. |
+| `/pz mods scan` | **admin** | Fill in `Mods=` for items the server has since downloaded. |
+| `/pz mods check` | **admin** | Ask a running server whether its mods have updates. |
 
 ### Two config commands, because there are two files
 
@@ -58,6 +67,21 @@ so "saliva only" is a thing you pick rather than something you have to know is
                 value:Saliva only
                 apply:True
 ```
+
+### Changing what the world *runs*, as opposed to what it is *like*
+
+`/pz version` and `/pz mods` are the two that can leave a save that will not open — a PZ
+build that converts a world one way only, a mod whose files went away while the map still
+references them. So both work the same way, and unlike everything else here:
+
+1. a labelled backup first, and **the change is abandoned if the backup fails**;
+2. the game is stopped around the edit rather than edited underneath;
+3. a two-step confirmation that says which of those two hazards applies before the button.
+
+The awkward one is adding a mod without its Mod IDs. `WorkshopItems=` is what the server
+downloads and `Mods=` is what it loads, and the ids that belong in the second live *inside*
+an item that is not on disk yet — so it takes two restarts: one to download, one to load.
+`/pz mods add` does both and says so. Pasting the Mod IDs from the Workshop page skips it.
 
 ## The three rules it is built around
 

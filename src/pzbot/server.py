@@ -46,6 +46,21 @@ BACKUP_NAME = re.compile(
 )
 LABEL = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
+# Mirror pzserver's `pz-<stack>-version` and `pz-<stack>-mods` document patterns. Same
+# rule as BACKUP_NAME above: the document is the enforcement, this is the error message.
+STEAM_BRANCH = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+WORKSHOP_ID = re.compile(r"^[0-9]{1,12}$")
+MOD_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+# Offered in the picker, not enforced: Steam publishes whatever branches it likes and PZ
+# has renamed these before, so a branch name that is not here is typed rather than
+# refused. SteamCMD's own error for a branch that does not exist is clear enough.
+STEAM_BRANCHES: dict[str, str] = {
+    "public": "The default branch \N{EM DASH} the current stable build",
+    "unstable": "The public beta, where new builds land first",
+    "b41multiplayer": "Build 41 multiplayer, for a world that cannot move to 42",
+}
+
 
 class Stage(enum.StrEnum):
     STOPPED = "stopped"
@@ -98,6 +113,22 @@ def _stage_for(instance: Instance, ready: bool) -> Stage:
             return Stage.READY if ready else Stage.BOOTING
         case _:
             return Stage.UNKNOWN
+
+
+def _json_report(stdout: str, *, what: str) -> dict:
+    """Every one of pzserver's newer tools answers in JSON. Insist on it.
+
+    A tool that printed prose instead of JSON has almost certainly failed in a way its
+    exit status did not capture, and treating that as an empty result would report "no
+    mods" for a server whose .ini could not be read.
+    """
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        raise OperationError(
+            f"Unreadable `{what}` response from the game server:"
+            f"\n```\n{stdout[-800:] or '(nothing)'}\n```"
+        ) from None
 
 
 class GameServer:
@@ -535,6 +566,93 @@ class GameServer:
             )
         return snap
 
+    async def _lifecycle(self, action: str, *, comment: str) -> CommandResult:
+        return await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("lifecycle"),
+            {"action": action},
+            timeout=300,
+            comment=comment,
+        )
+
+    # --- Editing a file the running game owns -----------------------------------------
+    #
+    # Three operations -- a sandbox option, the mod list, a Steam build -- all need the
+    # same sequence, and it is a sequence with a sharp edge in the middle: between the
+    # stop and the start there is an instance that is running, billing, and has no game
+    # on it. Every failure path below therefore ends with the server back up rather than
+    # with an exception thrown over a stopped world.
+
+    async def _stop_for_edit(
+        self, snap: Snapshot, progress: Progress, *, why: str, comment: str, on_fail: str
+    ) -> None:
+        """Warn whoever is playing, then stop the game so its files can be edited."""
+        if snap.player_count:
+            await self._broadcast(f"Server restarting in 30 seconds {why}.")
+            await progress(
+                f"Warning {snap.player_count} player(s), restarting in 30s\N{HORIZONTAL ELLIPSIS}"
+            )
+            await asyncio.sleep(30)
+
+        await progress("Stopping the game (it saves on the way down)\N{HORIZONTAL ELLIPSIS}")
+        stop = await self._lifecycle("stop", comment=comment)
+        if not stop.ok:
+            raise OperationError(f"{on_fail}\n```\n{stop.output[-1000:]}\n```")
+
+    async def _start_after_edit(
+        self,
+        progress: Progress,
+        *,
+        line: str,
+        comment: str,
+        on_fail: str,
+        on_timeout: str,
+    ) -> Snapshot:
+        await progress(line)
+        start = await self._lifecycle("start", comment=comment)
+        if not start.ok:
+            raise OperationError(f"{on_fail}\n```\n{start.output[-1000:]}\n```")
+        return await self._wait_until_ready(
+            progress, timeout=self.cfg.start_ready_timeout, timeout_message=on_timeout
+        )
+
+    async def _recover_from_failed_edit(self, progress: Progress, *, comment: str) -> None:
+        """Put the game back up after an edit failed with it already stopped.
+
+        Best-effort and deliberately not checked: the caller is about to raise the real
+        error, and the state to avoid is an instance running with no server on it --
+        billing at $0.20/hour with nobody able to play and nothing to say why.
+        """
+        await progress(
+            "The edit failed. Starting the server back up unchanged\N{HORIZONTAL ELLIPSIS}"
+        )
+        await self._lifecycle("start", comment=comment)
+
+    async def _backup_before(self, label: str, progress: Progress) -> None:
+        """Take a labelled backup before a change that can make the world unloadable.
+
+        Unlike `stop()`, which stops anyway when its backup fails, this one REFUSES. The
+        difference is what the backup is for: there, it is a bonus on top of the save
+        `ExecStop` performs regardless; here, it is the entire reason a bad mod or a
+        B41-to-B42 branch switch is survivable. pzserver DESIGN section 13 names this
+        pre-change backup as the prerequisite for managing mods from chat at all.
+        """
+        await progress(f"Taking a `{label}` backup first\N{HORIZONTAL ELLIPSIS}")
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("backup"),
+            {"mode": "manual", "label": label},
+            timeout=1800,
+            comment=f"pzbot {label}",
+        )
+        if not result.ok:
+            raise OperationError(
+                "The pre-change backup failed, so nothing was changed. This change is "
+                "one of the few that can leave a world that will not load, and it is not "
+                "worth making without a way back.\n"
+                f"```\n{result.output[-1000:]}\n```"
+            )
+
     # --- Sandbox options (the world's rules) -----------------------------------------
 
     @property
@@ -582,28 +700,13 @@ class GameServer:
 
         game_was_up = snap.stage in (Stage.READY, Stage.BOOTING)
         if apply and game_was_up:
-            if snap.player_count:
-                await self._broadcast(
-                    "Server restarting in 30 seconds to change the world settings."
-                )
-                await progress(
-                    f"Warning {snap.player_count} player(s), restarting in 30s"
-                    "\N{HORIZONTAL ELLIPSIS}"
-                )
-                await asyncio.sleep(30)
-            await progress("Stopping the game (it saves on the way down)\N{HORIZONTAL ELLIPSIS}")
-            stop = await self.aws.send_command(
-                self.cfg.game_instance_id,
-                self.cfg.document("lifecycle"),
-                {"action": "stop"},
-                timeout=300,
+            await self._stop_for_edit(
+                snap,
+                progress,
+                why="to change the world settings",
                 comment="pzbot /pz sandbox set (stop)",
+                on_fail="Could not stop the game, so nothing was changed:",
             )
-            if not stop.ok:
-                raise OperationError(
-                    "Could not stop the game, so nothing was changed:\n"
-                    f"```\n{stop.output[-1000:]}\n```"
-                )
 
         result = await self.aws.send_command(
             self.cfg.game_instance_id,
@@ -614,18 +717,8 @@ class GameServer:
         )
         if not result.ok:
             if apply and game_was_up:
-                # The edit failed with the game already stopped. Put it back up on the
-                # old settings rather than leaving an instance running with no server on
-                # it -- that is the state that bills without anyone able to play.
-                await progress(
-                    "The edit failed. Starting the server back up unchanged\N{HORIZONTAL ELLIPSIS}"
-                )
-                await self.aws.send_command(
-                    self.cfg.game_instance_id,
-                    self.cfg.document("lifecycle"),
-                    {"action": "start"},
-                    timeout=300,
-                    comment="pzbot /pz sandbox set (recover)",
+                await self._recover_from_failed_edit(
+                    progress, comment="pzbot /pz sandbox set (recover)"
                 )
             raise OperationError(
                 f"Could not change the sandbox options:\n```\n{result.output[-800:]}\n```"
@@ -637,24 +730,15 @@ class GameServer:
             changed = {"setting": path, "was": "?", "now": literal}
 
         if apply and game_was_up:
-            await progress("Starting back up on the new settings\N{HORIZONTAL ELLIPSIS}")
-            start = await self.aws.send_command(
-                self.cfg.game_instance_id,
-                self.cfg.document("lifecycle"),
-                {"action": "start"},
-                timeout=300,
-                comment="pzbot /pz sandbox set (start)",
-            )
-            if not start.ok:
-                raise OperationError(
-                    "The setting was changed, but the server did not come back up. The "
-                    "previous file is on the box as `*_SandboxVars.lua.pzbot.bak`.\n"
-                    f"```\n{start.output[-1000:]}\n```"
-                )
-            await self._wait_until_ready(
+            await self._start_after_edit(
                 progress,
-                timeout=self.cfg.start_ready_timeout,
-                timeout_message=(
+                line="Starting back up on the new settings\N{HORIZONTAL ELLIPSIS}",
+                comment="pzbot /pz sandbox set (start)",
+                on_fail=(
+                    "The setting was changed, but the server did not come back up. The "
+                    "previous file is on the box as `*_SandboxVars.lua.pzbot.bak`."
+                ),
+                on_timeout=(
                     "The setting was changed and the server was restarted, but it never "
                     "answered RCON again. The instance has been left running so the logs "
                     "survive -- check `journalctl -u pzserver`. The previous file is on "
@@ -753,6 +837,297 @@ class GameServer:
                 f"Could not retune the watchdog:\n```\n{result.output[-800:]}\n```"
             )
         return result.stdout.strip()
+
+    # --- The game build, and the mods on top of it -------------------------------------
+    #
+    # Two capabilities that pzserver DESIGN section 13 deferred out of v1 together, and
+    # for the same reason: both change what code the world loads, and getting either
+    # wrong produces a save that will not open rather than a server that will not start.
+    # Everything here therefore routes through `_backup_before`, which refuses the change
+    # if the backup fails.
+
+    async def _version_command(
+        self, action: str, branch: str = "", *, timeout: int = 120
+    ) -> dict[str, str]:
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("version"),
+            {"action": action, "branch": branch},
+            timeout=timeout,
+            comment=f"pzbot /pz version {action}",
+        )
+        if not result.ok:
+            raise OperationError(
+                f"`{action}` failed on the game server:\n```\n{result.output[-1000:]}\n```"
+            )
+        return _json_report(result.stdout, what="version")
+
+    async def version_status(self) -> dict[str, str]:
+        await self._require_instance_running("the game install")
+        return await self._version_command("status")
+
+    async def version_hold(self, on: bool) -> dict[str, str]:
+        """Pin the build on disk, or resume updating.
+
+        Not gated on the game being stopped: this writes a flag that `pz-update.sh` reads
+        at the START of the next session, so setting it mid-session changes nothing about
+        the session it is set in, which is the point of it.
+        """
+        await self._require_instance_running("the version pin")
+        return await self._version_command("hold" if on else "unhold")
+
+    async def version_update(
+        self, progress: Progress, *, validate: bool = False, branch: str = ""
+    ) -> dict[str, str]:
+        """Move this box to another build: latest on its branch, another branch, or repair.
+
+        The order is **back up, stop, update, start**, and the stop is not optional when
+        the game is up: SteamCMD rewriting files underneath a running JVM is its own kind
+        of corruption, and PZ will not notice until it crashes an hour later.
+        """
+        if branch and not STEAM_BRANCH.fullmatch(branch):
+            raise OperationError(
+                f"`{branch}` is not a Steam branch name \N{EM DASH} letters, numbers, "
+                "`.`, `-` and `_`, up to 32 characters."
+            )
+
+        snap = await self._require_instance_running("the game install")
+        game_was_up = snap.stage in (Stage.READY, Stage.BOOTING)
+
+        if branch:
+            label = "before-branch-switch"
+        elif validate:
+            label = "before-validate"
+        else:
+            label = "before-update"
+        await self._backup_before(label, progress)
+
+        if game_was_up:
+            await self._stop_for_edit(
+                snap,
+                progress,
+                why="to update the game",
+                comment="pzbot /pz version update (stop)",
+                on_fail="Could not stop the game, so nothing was updated:",
+            )
+
+        try:
+            if branch:
+                await progress(f"Pinning the Steam branch to `{branch}`\N{HORIZONTAL ELLIPSIS}")
+                await self._version_command("branch", branch)
+            if validate:
+                await progress(
+                    "Re-checksumming every file against Steam\N{HORIZONTAL ELLIPSIS} "
+                    "(this takes a while)"
+                )
+            else:
+                await progress("Running SteamCMD\N{HORIZONTAL ELLIPSIS}")
+            status = await self._version_command("validate" if validate else "update", timeout=3600)
+        except OperationError:
+            if game_was_up:
+                await self._recover_from_failed_edit(
+                    progress, comment="pzbot /pz version update (recover)"
+                )
+            raise
+
+        if game_was_up:
+            await self._start_after_edit(
+                progress,
+                line="Starting back up on the new build\N{HORIZONTAL ELLIPSIS}",
+                comment="pzbot /pz version update (start)",
+                on_fail=(
+                    "The update ran, but the server did not come back up. If the build it "
+                    "landed on is the problem, `/pz version hold` and a `/pz restore` of "
+                    f"the `{label}` backup put you back where you were."
+                ),
+                on_timeout=(
+                    "The update ran and the server was restarted, but it never answered "
+                    "RCON again. The instance has been left running so the logs survive "
+                    "\N{EM DASH} check `journalctl -u pzserver`. The world as it was before "
+                    f"this is in the `{label}` backup."
+                ),
+            )
+
+        status["applied"] = "yes" if game_was_up else "next start"
+        status["backup_label"] = label
+        return status
+
+    # --- Mods --------------------------------------------------------------------------
+
+    async def _mods_command(self, action: str, workshop_id: str = "", mod_ids: str = "") -> dict:
+        result = await self.aws.send_command(
+            self.cfg.game_instance_id,
+            self.cfg.document("mods"),
+            {"action": action, "workshopId": workshop_id, "modIds": mod_ids},
+            timeout=120,
+            comment=f"pzbot /pz mods {action}",
+        )
+        if not result.ok:
+            raise OperationError(
+                f"`mods {action}` failed on the game server:\n```\n{result.output[-1000:]}\n```"
+            )
+        return _json_report(result.stdout, what="mods")
+
+    async def mods_list(self) -> dict:
+        await self._require_instance_running("the server's mod list")
+        return await self._mods_command("list")
+
+    async def mods_check(self) -> str:
+        """Ask the running server whether its Workshop mods have updates waiting.
+
+        PZ answers this one into its own log rather than over RCON -- the RCON reply is an
+        acknowledgement, not a result -- so this reports what the server said and leaves
+        the interpretation to whoever asked. Worth having anyway: a mod update is picked
+        up by restarting, and knowing there is one to pick up is the whole question.
+        """
+        snap = await self.probe()
+        if snap.stage is not Stage.READY:
+            raise OperationError(
+                f"The server is `{snap.stage}` \N{EM DASH} only a running server can check "
+                "its mods."
+            )
+        return await self.rcon.execute("checkModsNeedUpdate", timeout=30)
+
+    async def mods_add(
+        self, workshop_id: str, mod_ids: str, progress: Progress, *, apply: bool = True
+    ) -> dict:
+        workshop_id = workshop_id.strip()
+        if not WORKSHOP_ID.fullmatch(workshop_id):
+            raise OperationError(
+                f"`{workshop_id}` is not a Steam Workshop id. It is the number at the end "
+                "of the item's Workshop URL \N{EM DASH} `?id=2169435993`."
+            )
+
+        wanted = [item for item in re.split(r"[,;\s]+", mod_ids) if item]
+        for mod_id in wanted:
+            if not MOD_ID.fullmatch(mod_id):
+                raise OperationError(
+                    f"`{mod_id}` is not a mod id. Mod ids are the names on the Workshop "
+                    "page under \N{LEFT DOUBLE QUOTATION MARK}Mod ID"
+                    "\N{RIGHT DOUBLE QUOTATION MARK}, not the item's title."
+                )
+        joined = ",".join(wanted)
+        if len(joined) > 400:
+            raise OperationError(
+                "That is more mod ids than one Workshop item plausibly ships (400 "
+                "characters max). Add it in two goes if it really does."
+            )
+
+        return await self._change_mods(
+            "add", progress, apply=apply, workshop_id=workshop_id, mod_ids=joined
+        )
+
+    async def mods_remove(
+        self, workshop_id: str, progress: Progress, *, apply: bool = True
+    ) -> dict:
+        workshop_id = workshop_id.strip()
+        if not WORKSHOP_ID.fullmatch(workshop_id):
+            raise OperationError(f"`{workshop_id}` is not a Steam Workshop id.")
+        return await self._change_mods("remove", progress, apply=apply, workshop_id=workshop_id)
+
+    async def mods_scan(self, progress: Progress) -> dict:
+        """Attribute the Workshop items the server has downloaded since they were added.
+
+        Adding an item the server has not downloaded yet can only write `WorkshopItems=`,
+        because the mod ids that belong in `Mods=` are inside the item. This is the second
+        half of that: it reads the downloaded items and fills `Mods=` in. `mods_add` runs
+        it for you when it has to; this is the door for the times it could not.
+        """
+        await self._require_instance_running("the server's mod list")
+        await progress("Reading the downloaded Workshop items\N{HORIZONTAL ELLIPSIS}")
+        return await self._mods_command("scan")
+
+    async def _change_mods(
+        self,
+        action: str,
+        progress: Progress,
+        *,
+        apply: bool,
+        workshop_id: str = "",
+        mod_ids: str = "",
+    ) -> dict:
+        """Back up, stop, edit the mod list, start. Optionally twice -- see below."""
+        snap = await self._require_instance_running("the server's mod list")
+        game_was_up = snap.stage in (Stage.READY, Stage.BOOTING)
+        restart = apply and game_was_up
+
+        await self._backup_before("before-mods", progress)
+
+        if restart:
+            await self._stop_for_edit(
+                snap,
+                progress,
+                why="to change the mod list",
+                comment=f"pzbot /pz mods {action} (stop)",
+                on_fail="Could not stop the game, so the mod list was not changed:",
+            )
+
+        try:
+            report = await self._mods_command(action, workshop_id, mod_ids)
+        except OperationError:
+            if restart:
+                await self._recover_from_failed_edit(
+                    progress, comment=f"pzbot /pz mods {action} (recover)"
+                )
+            raise
+
+        if not restart:
+            report["applied"] = "next start"
+            return report
+
+        await self._start_after_edit(
+            progress,
+            line="Starting back up with the new mod list\N{HORIZONTAL ELLIPSIS}",
+            comment=f"pzbot /pz mods {action} (start)",
+            on_fail=(
+                "The mod list was changed, but the server did not come back up. A mod "
+                "that will not load is the usual cause; the previous `.ini` is on the box "
+                "as `*.ini.pzbot.bak` and the `before-mods` backup is in S3."
+            ),
+            on_timeout=(
+                "The mod list was changed and the server was restarted, but it never "
+                "answered RCON again \N{EM DASH} which is what a mod that fails to load "
+                "looks like. Check `journalctl -u pzserver`; the previous `.ini` is on the "
+                "box as `*.ini.pzbot.bak`."
+            ),
+        )
+        report["applied"] = "yes"
+
+        # The second restart, and the reason this method is not just stop-edit-start.
+        #
+        # An item added without its mod ids could only be written to `WorkshopItems=`,
+        # because the ids live inside an item that was not on disk yet. The start above is
+        # what downloaded it -- so the ids are now readable, but PZ read `Mods=` before
+        # they were written into it. Without this the mod is listed, downloaded, and does
+        # nothing, which is the single most confusing state in PZ mod management.
+        if report.get("pending"):
+            await progress("Downloaded. Working out which mods it ships\N{HORIZONTAL ELLIPSIS}")
+            scan = await self._mods_command("scan")
+            report["scanned"] = scan
+            if scan.get("resolved"):
+                await self._stop_for_edit(
+                    await self.probe(),
+                    progress,
+                    why="to load the mods that just downloaded",
+                    comment=f"pzbot /pz mods {action} (stop for scan)",
+                    on_fail=(
+                        "The mods were found, but the server could not be stopped to load "
+                        "them. They take effect on the next restart:"
+                    ),
+                )
+                await self._start_after_edit(
+                    progress,
+                    line="Starting again, this time with the mods loaded\N{HORIZONTAL ELLIPSIS}",
+                    comment=f"pzbot /pz mods {action} (start for scan)",
+                    on_fail="The mods were found, but the server did not come back up.",
+                    on_timeout=(
+                        "The mods were found and the server was restarted, but it never "
+                        "answered RCON again \N{EM DASH} check `journalctl -u pzserver`."
+                    ),
+                )
+                report["applied"] = "yes, after two restarts"
+
+        return report
 
 
 @dataclass(frozen=True)

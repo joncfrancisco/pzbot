@@ -246,6 +246,88 @@ deploy.**
 Every change keeps the previous file on the box as `*_SandboxVars.lua.pzbot.bak`, and
 `Server/` is in every backup — so `/pz restore` also rolls sandbox settings back.
 
+## Upgrading the game, and managing mods
+
+`/pz config` and `/pz sandbox` change what the world is *like*. `/pz version` and
+`/pz mods` change what code it *runs*, and either can leave a save that will not open — so
+both take a labelled backup first and **abandon the change if that backup fails**, stop the
+game around the edit rather than editing underneath it, and ask before any of it.
+
+### The game version
+
+```
+/pz version status          → build id, Steam branch, whether updates are held
+/pz version hold            → pin the build that is on there now
+/pz version unhold          → resume updating on the next start
+/pz version update          → back up, stop, SteamCMD, start
+/pz version update validate:true   → the same, re-checksumming every file. Slow.
+/pz version branch name:…   → switch Steam branch. The save-breaking one.
+```
+
+By default every `/pz start` updates to the latest build on the branch this server tracks.
+`hold` is what you reach for on the day a PZ patch breaks something and people want to
+play tonight; it is written to the **data volume**, so it survives a reboot and an instance
+rebuild rather than lasting only for the session (which is what `/pz idle` does, and the
+difference is deliberate).
+
+`validate:true` is for a **corrupt install** — missing textures, a crash on world load that
+a restore does not fix, an interrupted update — not for a patch. It re-checksums several
+gigabytes and it is off the normal start path precisely because it is slow.
+
+**`/pz version branch` is the most save-breaking thing here that is not a restore.**
+Branches are different versions of the game: a Build 41 save opened by Build 42 is
+converted and cannot go back, and a Build 42 save will not open on 41 at all. If it goes
+wrong the way back is `/pz version branch` to the old branch **and then** `/pz restore` of
+the `before-branch-switch` backup — in that order, because restoring a 42 save onto a 41
+server does not help.
+
+Note that `branch` records the pin and downloads nothing; the switch happens on the update
+that follows, which `/pz version branch` runs for you. Until then `/pz version status`
+shows the pinned and installed branches disagreeing, and says so.
+
+### Mods
+
+```
+/pz mods list                                   → what is installed, and what each item ships
+/pz mods add workshop_id:2169435993 mod_ids:Authentic_Z,AuthenticZ_Clothing
+/pz mods add workshop_id:2392709985             → work the mod ids out from the download
+/pz mods remove workshop_id:…                   → autocompleted from what is installed
+/pz mods scan                                   → fill in Mods= for items since downloaded
+/pz mods check                                  → does the running server think mods need updating
+```
+
+**Two lists, and the difference is the whole subject.** `WorkshopItems=` is what the server
+downloads from Steam; `Mods=` is what the game loads, in load order. One Workshop item can
+ship several mods, so they are not one-to-one, and a Workshop id does not tell you what is
+inside it — which is why `mod_ids` is worth pasting from the item's Workshop page (the
+field labelled **Mod ID**, not the item's title).
+
+Leave `mod_ids` empty and the bot does it the long way: it writes `WorkshopItems=`, starts
+the server so Steam downloads the item, reads the ids out of it, writes `Mods=`, and
+restarts **again** — because PZ read `Mods=` before that last part happened. It says which
+of those it is doing while it does it. If it is ever interrupted, `/pz mods scan` picks up
+from wherever it got to.
+
+An item listed in `WorkshopItems=` with nothing in `Mods=` is **installed and loading
+nothing** — the most confusing state in PZ mod management, and the one `/pz mods list`
+flags with a warning against that item.
+
+**Removing a mod is the more dangerous direction, not the safer one.** Anything it spawned
+into the map goes with it, and the world may not open afterwards. Same backup, same
+confirmation.
+
+New mods are appended, so they load last. PZ resolves conflicts in load order; if two mods
+fight, remove and re-add the one that should win.
+
+`/pz mods check` asks a running server to check for Workshop updates. PZ answers that one
+into its **own log** rather than over RCON, so what comes back is an acknowledgement rather
+than a verdict — the command says so, and points at `journalctl -u pzserver`. A mod update
+is picked up by restarting, so `/pz restart` is the action either way.
+
+Every change keeps the previous `.ini` on the box as `*.ini.pzbot.bak`, and the mod list is
+inside `Server/`, which is in every backup — so `/pz restore` rolls the mod list back with
+the world.
+
 ## Rotating the Discord token
 
 ```bash

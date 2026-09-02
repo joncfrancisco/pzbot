@@ -24,7 +24,8 @@ from ..guards import Tier
 from ..server import INI_KEYS, OperationError
 from ..singleflight import Busy
 from .backups import BackupGroup, backup_autocomplete
-from .base import Ctx, Live, busy_embed
+from .base import Ctx, Live, busy_embed, confirmed
+from .maintenance import ModsGroup, VersionGroup
 from .world import SandboxGroup
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ class PzGroup(app_commands.Group, name="pz", description="Project Zomboid server
         self.add_command(BackupGroup(ctx))
         self.add_command(ConfigGroup(ctx))
         self.add_command(SandboxGroup(ctx))
+        self.add_command(VersionGroup(ctx))
+        self.add_command(ModsGroup(ctx))
 
     # --- Read-only -------------------------------------------------------------------
 
@@ -276,7 +279,6 @@ class PzGroup(app_commands.Group, name="pz", description="Project Zomboid server
         guards.check(interaction, self.ctx.cfg, Tier.ADMIN)
 
         snap = await self.ctx.server.probe()
-        confirm = ConfirmRestore(interaction.user.id)
         embed = discord.Embed(
             title="\N{WARNING SIGN}  Restore the world?",
             colour=render.BAD,
@@ -292,20 +294,10 @@ class PzGroup(app_commands.Group, name="pz", description="Project Zomboid server
         )
         embed.add_field(name="Server is", value=f"{snap.stage.emoji} `{snap.stage}`")
         embed.add_field(name="Players online", value=str(snap.player_count))
-        embed.set_footer(text="This confirmation expires in 60 seconds.")
 
-        await interaction.response.send_message(embed=embed, view=confirm)
-        await confirm.wait()
-
-        if not confirm.value:
-            await interaction.edit_original_response(
-                embed=discord.Embed(
-                    title="Restore cancelled",
-                    description="Nothing was changed.",
-                    colour=render.OFF,
-                ),
-                view=None,
-            )
+        if not await confirmed(
+            interaction, embed, label="Restore the world", title="Restore cancelled"
+        ):
             return
 
         live = Live(interaction, f"Restoring {backup}")
@@ -330,40 +322,6 @@ class PzGroup(app_commands.Group, name="pz", description="Project Zomboid server
         done.add_field(name="Output", value=f"```\n{result.output[-900:]}\n```", inline=False)
         await live.finish(embed=done)
         await self.ctx.audit.record(interaction, "restore", detail=backup)
-
-
-class ConfirmRestore(discord.ui.View):
-    """Two-step confirmation, bound to the person who asked.
-
-    The `user_id` check is not paranoia about attackers -- it is about the far more
-    likely accident of someone else in the channel clicking the red button on a
-    confirmation they did not read.
-    """
-
-    def __init__(self, user_id: int) -> None:
-        super().__init__(timeout=60)
-        self.user_id = user_id
-        self.value = False
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "This confirmation belongs to whoever ran the command.", ephemeral=True
-            )
-            return False
-        return True
-
-    @discord.ui.button(label="Restore the world", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        self.value = True
-        await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        self.value = False
-        await interaction.response.defer()
-        self.stop()
 
 
 class ConfigGroup(app_commands.Group, name="config", description="Read and write server options"):

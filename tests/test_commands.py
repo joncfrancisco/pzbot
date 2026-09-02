@@ -19,8 +19,10 @@ from pzbot.config import Runtime
 from pzbot.server import GameServer, Snapshot, Stage
 from pzbot.singleflight import SingleFlight
 
-# The command table in pzserver DESIGN section 10. If this list changes, the design doc
-# and this test should change together -- that is the point of asserting on it.
+# The command table in pzserver DESIGN section 10, plus the version and mod management
+# that DESIGN section 13 deferred out of v1 and has since landed. If this list changes,
+# the design doc and this test should change together -- that is the point of asserting
+# on it.
 EXPECTED = {
     "pz status",
     "pz start",
@@ -37,6 +39,16 @@ EXPECTED = {
     "pz sandbox set",
     "pz idle",
     "pz cost",
+    "pz version status",
+    "pz version hold",
+    "pz version unhold",
+    "pz version update",
+    "pz version branch",
+    "pz mods list",
+    "pz mods add",
+    "pz mods remove",
+    "pz mods scan",
+    "pz mods check",
 }
 
 
@@ -76,6 +88,14 @@ def test_stop_takes_a_force_flag(group):
 def test_restore_offers_autocomplete_rather_than_a_free_text_key(group):
     restore = next(c for c in group.commands if c.name == "restore")
     assert restore._params["backup"].autocomplete is not None
+
+
+def test_removing_a_mod_offers_the_ones_installed(group):
+    # Nobody knows a Workshop id by heart, and typing the wrong one removes a mod the
+    # world is using. The picker is what stops that being a free-text field.
+    mods = next(c for c in group.commands if c.name == "mods")
+    remove = next(c for c in mods.commands if c.name == "remove")
+    assert remove._params["workshop_id"].autocomplete is not None
 
 
 def test_the_group_is_guild_only(group):

@@ -59,6 +59,7 @@ src/pzbot/
     core.py      ← /pz status start stop who restart save idle cost restore, /pz config
     backups.py   ← /pz backup now|list and the restore autocomplete
     world.py     ← /pz sandbox get|set, with both halves of the picker autocompleted
+    maintenance.py← /pz version and /pz mods — the two that change what CODE the world runs
 deploy/          ← pzbot.service, install.sh (idempotent; also the upgrade path), env template
 requirements.in  ← the direct deps and their intended ranges; humans edit THIS
 requirements.txt ← pip-compile lockfile, fully pinned + hashed; install.sh --require-hashes
@@ -137,6 +138,28 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   the game, so an edit made underneath a live server can be silently undone. The failure
   path matters too: if the edit fails after the game is stopped, `sandbox_set` starts it
   back up on the old settings rather than leaving an instance billing with no server.
+- **`/pz version` and `/pz mods` back up first and refuse the change if it fails.** That
+  is the difference from `/pz stop`, which stops anyway when its backup fails: there the
+  backup is a bonus on top of the save `ExecStop` performs regardless; here it is the
+  entire reason a bad mod or a B41-to-B42 branch switch is survivable. `_backup_before` is
+  the one place that rule lives — do not give it a "skip the backup" flag.
+- **`WorkshopItems=` and `Mods=` are two lists that are not one-to-one.** One item can ship
+  several mods, and a mod id is not derivable from a Workshop id without reading the
+  downloaded item. `pz-mod-tool.py` on the game server keeps the association; this repo
+  only ever validates ids and sequences restarts around the edit.
+- **Adding a mod without its Mod IDs costs two restarts, and that is not a bug.** The ids
+  are inside an item that is not on disk, so the first pass writes `WorkshopItems=` only,
+  the start downloads it, `scan` then writes `Mods=` — and PZ read `Mods=` before that
+  happened. `_change_mods` does the second restart itself rather than leaving a mod that
+  is installed, listed, and loading nothing, which is the most confusing state in PZ mod
+  management.
+- **A branch pin does not download anything.** `version_update(branch=…)` sends `branch`
+  and *then* `update`, in that order, because `pz-update.sh` reads the pin out of
+  `version.conf` — a pin written afterwards would take effect a session late.
+- **`STEAM_BRANCHES` is a picker, not an allowlist.** Steam publishes whatever branches it
+  likes and PZ has renamed these before, so an unknown name is typed rather than refused;
+  the regex bounds the shape and SteamCMD's own error covers the rest. Turning it into an
+  allowlist would make the bot the reason a real branch cannot be used.
 - **The sandbox enum *labels* are ours; the numbers are the game's.** They match the
   in-game sandbox screen for B41/B42. `/pz sandbox get` prints the raw number next to the
   label (`2 (Saliva only)`) and prints `(not a known option)` for a number outside our
