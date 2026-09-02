@@ -130,6 +130,87 @@ class Cached:
         self._fetched = None
 
 
+class Confirm(discord.ui.View):
+    """Two-step confirmation, bound to the person who asked.
+
+    The `user_id` check is not paranoia about attackers -- it is about the far more
+    likely accident of someone else in the channel clicking the red button on a
+    confirmation they did not read.
+
+    Buttons are built in `__init__` rather than declared with `@discord.ui.button`,
+    because the label is the whole point: "Restore the world" and "Switch to b41multiplayer"
+    are different promises, and a view that says `Confirm` for both is a view people click
+    without reading.
+    """
+
+    def __init__(
+        self,
+        user_id: int,
+        label: str,
+        *,
+        style: discord.ButtonStyle = discord.ButtonStyle.danger,
+    ) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.value = False
+
+        go = discord.ui.Button(label=label, style=style)
+        go.callback = self._confirm
+        back_out = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        back_out.callback = self._cancel
+        self.add_item(go)
+        self.add_item(back_out)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This confirmation belongs to whoever ran the command.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _confirm(self, interaction: discord.Interaction) -> None:
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    async def _cancel(self, interaction: discord.Interaction) -> None:
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
+
+
+async def confirmed(
+    interaction: discord.Interaction,
+    embed: discord.Embed,
+    *,
+    label: str,
+    title: str = "Cancelled",
+    cancelled: str = "Nothing was changed.",
+) -> bool:
+    """Put a decision in front of someone and wait for it. False means: do nothing.
+
+    Every command that reaches this point is one that can lose a world -- a restore, a
+    branch switch, a mod change. They all owe the same thing: say what is about to happen
+    in full BEFORE the button, and leave a message behind saying nothing happened when the
+    button is not pressed. A confirmation that times out silently reads as one that was
+    accepted.
+    """
+    view = Confirm(interaction.user.id, label)
+    embed.set_footer(text="This confirmation expires in 60 seconds.")
+    await interaction.response.send_message(embed=embed, view=view)
+    await view.wait()
+
+    if view.value:
+        return True
+
+    await interaction.edit_original_response(
+        embed=discord.Embed(title=title, description=cancelled, colour=render.OFF),
+        view=None,
+    )
+    return False
+
+
 def busy_embed(busy: Busy) -> discord.Embed:
     """Rejected, not queued. DESIGN section 10 is explicit about the difference."""
     holder = busy.holder

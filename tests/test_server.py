@@ -9,11 +9,13 @@ prevent.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from botocore.exceptions import ClientError
 
 from conftest import FakeRcon, backup, noop_progress
+from pzbot.aws import CommandResult
 from pzbot.rcon import RconAuthError, RconUnreachable
 from pzbot.server import OperationError, Stage
 
@@ -490,3 +492,246 @@ async def test_reaching_the_box_while_it_is_off_explains_itself(server, aws, ope
     with pytest.raises(OperationError, match="instance is stopped"):
         await operation(server)
     assert aws.commands == []
+
+
+# --- The game build ------------------------------------------------------------------------
+
+
+def cmds(aws) -> list[str]:
+    return [c.removeprefix("cmd:pzbot ") for c in aws.calls if c.startswith("cmd:")]
+
+
+async def test_version_status_reports_what_steam_says_not_what_was_asked_for(server, aws):
+    # `configured_branch` is the pin; `installed_branch` is the manifest. They can differ,
+    # and the difference is the whole point of showing both.
+    aws.state = "running"
+    aws.version_result = CommandResult(
+        "Success",
+        json.dumps({"installed_build": "18102025", "installed_branch": "unstable", "hold": True}),
+        "",
+    )
+    status = await server.version_status()
+    assert status["installed_branch"] == "unstable"
+    assert status["hold"] is True
+    assert aws.commands == [("pz-prod-version", {"action": "status", "branch": ""})]
+
+
+async def test_updating_backs_up_stops_updates_then_starts(server, aws):
+    aws.state = "running"
+    status = await server.version_update(noop_progress)
+
+    assert cmds(aws) == [
+        "before-update",
+        "/pz version update (stop)",
+        "/pz version update",
+        "/pz version update (start)",
+    ]
+    assert aws.commands[0] == ("pz-prod-backup", {"mode": "manual", "label": "before-update"})
+    assert aws.commands[2] == ("pz-prod-version", {"action": "update", "branch": ""})
+    assert status["applied"] == "yes"
+    assert status["backup_label"] == "before-update"
+
+
+async def test_a_failed_backup_stops_the_whole_update(server, aws):
+    # Unlike /pz stop, which stops anyway: here the backup is the only way back from a
+    # build that will not load the save, so no backup means no update.
+    aws.state = "running"
+    aws.results["-backup"] = [CommandResult("Failed", "", "no space left on device")]
+
+    with pytest.raises(OperationError, match="pre-change backup failed"):
+        await server.version_update(noop_progress)
+    # Nothing was stopped, so nobody was kicked off for an update that never happened.
+    assert [c for c in aws.commands if c[0] == "pz-prod-lifecycle"] == []
+
+
+async def test_a_failed_update_puts_the_server_back_up(server, aws):
+    aws.state = "running"
+    aws.results["-version"] = [CommandResult("Failed", "", "steamcmd: no subscription")]
+
+    with pytest.raises(OperationError, match="failed on the game server"):
+        await server.version_update(noop_progress)
+    assert aws.commands[-1] == ("pz-prod-lifecycle", {"action": "start"})
+
+
+async def test_switching_branch_pins_it_before_downloading_it(server, aws):
+    # Order is load-bearing: pz-update.sh reads the pin out of version.conf, so a pin
+    # written after the update would take effect a session late.
+    aws.state = "running"
+    await server.version_update(noop_progress, branch="b41multiplayer")
+
+    version_calls = [c for c in aws.commands if c[0] == "pz-prod-version"]
+    assert version_calls == [
+        ("pz-prod-version", {"action": "branch", "branch": "b41multiplayer"}),
+        ("pz-prod-version", {"action": "update", "branch": ""}),
+    ]
+    assert aws.commands[0] == (
+        "pz-prod-backup",
+        {"mode": "manual", "label": "before-branch-switch"},
+    )
+
+
+async def test_a_branch_name_that_is_not_one_never_reaches_the_box(server, aws):
+    aws.state = "running"
+    with pytest.raises(OperationError, match="not a Steam branch name"):
+        await server.version_update(noop_progress, branch="public; rm -rf /")
+    assert aws.commands == []
+
+
+async def test_validating_asks_for_a_validate_and_says_so_in_the_backup_label(server, aws):
+    aws.state = "running"
+    status = await server.version_update(noop_progress, validate=True)
+    assert ("pz-prod-version", {"action": "validate", "branch": ""}) in aws.commands
+    assert status["backup_label"] == "before-validate"
+
+
+async def test_holding_does_not_need_the_game_stopped(server, aws):
+    # It writes a flag pz-update.sh reads at the START of the next session, so it changes
+    # nothing about the session it is set in and has no business interrupting one.
+    aws.state = "running"
+    await server.version_hold(True)
+    assert aws.commands == [("pz-prod-version", {"action": "hold", "branch": ""})]
+
+    aws.commands.clear()
+    await server.version_hold(False)
+    assert aws.commands == [("pz-prod-version", {"action": "unhold", "branch": ""})]
+
+
+# --- Mods ------------------------------------------------------------------------------------
+
+
+async def test_mods_list_parses_the_inventory(server, aws):
+    aws.state = "running"
+    inventory = await server.mods_list()
+    assert inventory["workshop_items"] == ["2169435993"]
+    assert inventory["entries"][0]["mods"] == ["Authentic_Z"]
+
+
+@pytest.mark.parametrize(
+    "workshop_id",
+    [
+        "https://steamcommunity.com/sharedfiles/filedetails/?id=2169435993",  # the URL
+        "2169435993; systemctl stop pzserver",
+        "",
+        "12345678901234",  # longer than any Workshop id
+    ],
+)
+async def test_a_workshop_id_that_is_not_one_never_reaches_the_box(server, aws, workshop_id):
+    aws.state = "running"
+    with pytest.raises(OperationError, match="Workshop id"):
+        await server.mods_add(workshop_id, "", noop_progress)
+    assert aws.commands == []
+
+
+async def test_a_mod_id_that_is_not_one_never_reaches_the_box(server, aws):
+    aws.state = "running"
+    with pytest.raises(OperationError, match="not a mod id"):
+        await server.mods_add("2169435993", "Authentic_Z,../../etc/passwd", noop_progress)
+    assert aws.commands == []
+
+
+async def test_adding_a_mod_backs_up_stops_edits_and_restarts(server, aws):
+    aws.state = "running"
+    report = await server.mods_add("2169435993", "Authentic_Z, AuthenticZ_Clothing", noop_progress)
+
+    assert cmds(aws) == [
+        "before-mods",
+        "/pz mods add (stop)",
+        "/pz mods add",
+        "/pz mods add (start)",
+    ]
+    # Whitespace around the comma is what a person types; the box must not see it.
+    assert aws.commands[2] == (
+        "pz-prod-mods",
+        {
+            "action": "add",
+            "workshopId": "2169435993",
+            "modIds": "Authentic_Z,AuthenticZ_Clothing",
+        },
+    )
+    assert report["applied"] == "yes"
+
+
+async def test_an_item_whose_mods_are_unknown_is_scanned_and_restarted_again(server, aws):
+    # The confusing state this exists to prevent: the item is in WorkshopItems=, the
+    # server downloaded it on the restart, and Mods= is still empty -- so it is installed
+    # and loading nothing. Finding the ids needs the download; loading them needs another
+    # restart, because PZ read Mods= before they were written.
+    aws.state = "running"
+    aws.results["-mods"] = [
+        CommandResult("Success", json.dumps({"pending": True, "entries": []}), ""),
+        CommandResult(
+            "Success",
+            json.dumps({"resolved": [{"workshop_id": "2169435993", "mods": ["Zed"]}]}),
+            "",
+        ),
+    ]
+
+    report = await server.mods_add("2169435993", "", noop_progress)
+
+    assert cmds(aws) == [
+        "before-mods",
+        "/pz mods add (stop)",
+        "/pz mods add",
+        "/pz mods add (start)",
+        "/pz mods scan",
+        "/pz mods add (stop for scan)",
+        "/pz mods add (start for scan)",
+    ]
+    assert report["applied"] == "yes, after two restarts"
+
+
+async def test_a_scan_that_finds_nothing_does_not_restart_a_second_time(server, aws):
+    aws.state = "running"
+    aws.results["-mods"] = [
+        CommandResult("Success", json.dumps({"pending": True}), ""),
+        CommandResult("Success", json.dumps({"resolved": [], "still_pending": ["216"]}), ""),
+    ]
+    report = await server.mods_add("2169435993", "", noop_progress)
+    assert cmds(aws).count("/pz mods add (start)") == 1
+    assert "stop for scan" not in " ".join(cmds(aws))
+    assert report["applied"] == "yes"
+
+
+async def test_apply_off_edits_the_mod_list_without_touching_the_session(server, aws):
+    aws.state = "running"
+    report = await server.mods_remove("2169435993", noop_progress, apply=False)
+    assert cmds(aws) == ["before-mods", "/pz mods remove"]
+    assert report["applied"] == "next start"
+
+
+async def test_a_failed_mod_edit_puts_the_server_back_up(server, aws):
+    aws.state = "running"
+    aws.results["-mods"] = [CommandResult("Failed", "", "mods: already in the list")]
+    with pytest.raises(OperationError, match="failed on the game server"):
+        await server.mods_add("2169435993", "Zed", noop_progress)
+    assert aws.commands[-1] == ("pz-prod-lifecycle", {"action": "start"})
+
+
+async def test_a_failed_backup_stops_a_mod_change(server, aws):
+    aws.state = "running"
+    aws.results["-backup"] = [CommandResult("Failed", "", "no space left on device")]
+    with pytest.raises(OperationError, match="pre-change backup failed"):
+        await server.mods_add("2169435993", "Zed", noop_progress)
+    assert [c for c in aws.commands if c[0] == "pz-prod-mods"] == []
+
+
+async def test_prose_where_json_was_expected_is_an_error_not_an_empty_mod_list(server, aws):
+    # Reporting "no mods" for an .ini that could not be read would have somebody adding a
+    # mod that is already there, or removing one that is not.
+    aws.state = "running"
+    aws.results["-mods"] = [CommandResult("Success", "mods: 3 items", "")]
+    with pytest.raises(OperationError, match="Unreadable `mods` response"):
+        await server.mods_list()
+
+
+async def test_checking_for_mod_updates_needs_a_server_that_is_actually_up(server, aws):
+    aws.state = "running"
+    server.rcon.fail = RconUnreachable("connection refused")
+    with pytest.raises(OperationError, match="only a running server"):
+        await server.mods_check()
+
+
+async def test_checking_for_mod_updates_asks_the_game(server, aws):
+    aws.state = "running"
+    assert "checkModsNeedUpdate" in await server.mods_check()
+    assert "checkModsNeedUpdate" in server.rcon.commands

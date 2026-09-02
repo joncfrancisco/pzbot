@@ -28,6 +28,50 @@ class FakeAws:
         self.sandbox_result = CommandResult(
             "Success", json.dumps({"setting": "?", "was": "1", "now": "2"}), ""
         )
+        # pz-version.sh and pz-mod-tool.py both answer in JSON, and the bot insists on
+        # it, so the fakes have to as well -- a bare "done" here would make every test
+        # of those paths fail for the wrong reason.
+        self.version_result = CommandResult(
+            "Success",
+            json.dumps(
+                {
+                    "installed_build": "18102025",
+                    "installed_branch": "public",
+                    "configured_branch": "",
+                    "last_updated": "2026-08-30T09:00:00Z",
+                    "hold": False,
+                    "hold_reason": "",
+                    "server_running": False,
+                    "note": "",
+                }
+            ),
+            "",
+        )
+        self.mods_result = CommandResult(
+            "Success",
+            json.dumps(
+                {
+                    "workshop_items": ["2169435993"],
+                    "mods": ["Authentic_Z"],
+                    "entries": [
+                        {
+                            "workshop_id": "2169435993",
+                            "mods": ["Authentic_Z"],
+                            "added": "2026-09-01T12:00:00Z",
+                            "tracked": True,
+                            "pending": False,
+                        }
+                    ],
+                    "unattributed_mods": [],
+                }
+            ),
+            "",
+        )
+        # Per-document overrides, keyed by the document-name suffix ("-backup", "-mods").
+        # Each entry is a list consumed in order and the LAST one sticks, so a
+        # one-element list is a plain override and a two-element list is "fail the first
+        # call, succeed after" -- which is how the two-restart mod path gets tested.
+        self.results: dict[str, list[CommandResult]] = {}
         self.backups: list[Backup] = []
         self.parameters: dict[str, str] = {}
         # What `find_instance` resolves the pz:role=gameserver tag to. "" means nothing
@@ -80,8 +124,15 @@ class FakeAws:
     ) -> CommandResult:
         self.calls.append(f"cmd:{comment}")
         self.commands.append((document, dict(parameters)))
+        for suffix, queued in self.results.items():
+            if document.endswith(suffix):
+                return queued.pop(0) if len(queued) > 1 else queued[0]
         if document.endswith("-sandbox"):
             return self.sandbox_result
+        if document.endswith("-version"):
+            return self.version_result
+        if document.endswith("-mods"):
+            return self.mods_result
         return self.command_result
 
     async def list_backups(self, bucket, stack, limit=200) -> list[Backup]:

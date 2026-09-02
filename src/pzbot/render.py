@@ -277,3 +277,98 @@ def sandbox_setting(path: str, setting: SandboxSetting, current: str | None) -> 
         )
     embed.set_footer(text=f"/pz sandbox set setting:{path}")
     return embed
+
+
+def version(cfg: Config, status: dict[str, str]) -> discord.Embed:
+    """Which build this box runs, and whether it is going to change on its own."""
+    held = bool(status.get("hold"))
+    configured = str(status.get("configured_branch") or "")
+    installed = str(status.get("installed_branch") or "public")
+
+    embed = discord.Embed(
+        title="Game version",
+        colour=BUSY if held else IDLE,
+        description=f"Steam app `380870` on `{cfg.stack}`.",
+    )
+    embed.add_field(name="Build", value=f"`{status.get('installed_build') or 'unknown'}`")
+    embed.add_field(name="Branch", value=f"`{installed}`")
+
+    if status.get("last_updated"):
+        embed.add_field(name="Updated", value=f"`{status['last_updated']}`")
+
+    if held:
+        embed.add_field(
+            name="⏸️ Updates held",
+            value=(
+                f"This build is pinned ({status.get('hold_reason') or 'held'}). The server "
+                "will not update itself on the next start.\n`/pz version unhold` resumes."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Updates",
+            value="On — every start pulls the latest build on this branch.",
+            inline=False,
+        )
+
+    # A pin that does not match what is installed is the state worth shouting about: it
+    # means the branch was changed and nothing has run an update since, so the next start
+    # silently moves the world onto a different build of the game.
+    if configured and configured != installed:
+        embed.add_field(
+            name="⚠️ Pinned to a branch it is not on",
+            value=(
+                f"`version.conf` says `{configured}`, the install says `{installed}`. The "
+                "next update moves it. `/pz version update` does it now, with a backup "
+                "and a restart around it."
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text="/pz version update · hold · unhold · branch")
+    return embed
+
+
+def mods(cfg: Config, inventory: dict) -> discord.Embed:
+    """The Workshop items this world loads, and which mods each one contributes."""
+    entries = inventory.get("entries") or []
+    embed = discord.Embed(
+        title="Workshop mods",
+        colour=IDLE,
+        description=f"`{cfg.server_name}.ini` — `WorkshopItems=` and `Mods=`.",
+    )
+
+    if not entries:
+        embed.description += "\n\nNo Workshop items. `/pz mods add` puts one on."
+        return embed
+
+    for entry in entries[:20]:
+        wid = entry.get("workshop_id", "?")
+        loaded = entry.get("mods") or []
+        flags = []
+        if entry.get("pending"):
+            # Downloaded or not, an item with nothing in Mods= is loading nothing at all.
+            flags.append("⚠️ not loaded yet — `/pz mods scan`")
+        if not entry.get("tracked"):
+            flags.append("added outside this bot")
+        value = ", ".join(f"`{m}`" for m in loaded) if loaded else "*no mods listed*"
+        if flags:
+            value += "\n" + " · ".join(flags)
+        embed.add_field(name=f"`{wid}`", value=value, inline=False)
+
+    orphans = inventory.get("unattributed_mods") or []
+    if orphans:
+        embed.add_field(
+            name="Loaded, but from no listed item",
+            value=(
+                ", ".join(f"`{m}`" for m in orphans[:20])
+                + "\n\nBuilt-in mods look like this, and so do the leftovers of a Workshop "
+                "item somebody removed from `WorkshopItems=` by hand."
+            ),
+            inline=False,
+        )
+
+    shown = "" if len(entries) <= 20 else f"{len(entries)} items, showing the first 20 · "
+    embed.set_footer(text=f"{shown}Load order is the order shown · /pz mods add | remove")
+    return embed
