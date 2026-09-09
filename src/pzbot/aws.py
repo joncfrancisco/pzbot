@@ -48,6 +48,18 @@ _BOTO = BotoConfig(
     user_agent_extra="pzbot/1.0",
 )
 
+# S3 gets the same config plus an EXPLICIT SigV4, and the explicit part is load-bearing.
+#
+# botocore still presigns S3 with SigV2 by default in some resolutions -- the giveaway is
+# a URL carrying `AWSAccessKeyId=`/`Signature=`/`Expires=` rather than `X-Amz-*`. S3
+# stopped accepting SigV2 on buckets created after 24 June 2020, and `pz-<stack>-backups`
+# is years newer than that, so an unpinned signer produces a link that is generated
+# without complaint, looks entirely correct, and answers `InvalidRequest: Please use
+# AWS4-HMAC-SHA256` the moment anybody clicks it. Nothing on this side sees that failure.
+#
+# It only affects presigning; ordinary calls (`list_objects_v2`) already negotiate SigV4.
+_S3 = _BOTO.merge(BotoConfig(signature_version="s3v4"))
+
 
 @dataclass(frozen=True)
 class Instance:
@@ -125,7 +137,7 @@ class Aws:
         self.region = region
         self._ec2 = session.client("ec2", config=_BOTO)
         self._ssm = session.client("ssm", config=_BOTO)
-        self._s3 = session.client("s3", config=_BOTO)
+        self._s3 = session.client("s3", config=_S3)
         self._cw = session.client("cloudwatch", config=_BOTO)
         # Cost Explorer is a us-east-1-only endpoint regardless of where the stack runs.
         self._ce = session.client("ce", region_name="us-east-1", config=_BOTO)
@@ -287,6 +299,42 @@ class Aws:
                         out.append(Backup(obj["Key"], obj["Size"], obj["LastModified"]))
             out.sort(key=lambda b: b.modified, reverse=True)
             return out[:limit]
+
+        return await asyncio.to_thread(call)
+
+    async def presign_backup(
+        self, bucket: str, key: str, *, expires_in: int, filename: str = ""
+    ) -> str:
+        """A time-limited GET URL for one archive.
+
+        No API call happens here -- a presigned URL is arithmetic over credentials this
+        process already holds -- so this needs nothing beyond the `s3:GetObject` on
+        `backups/*` that `pz-bot-role` already grants for `/pz restore` (pzserver DESIGN
+        section 9). S3 evaluates that policy when the URL is *used*, against the role, so
+        a signature can never reach an object the bot itself could not read. It is still
+        pushed to a thread, because resolving instance-profile credentials can go to IMDS
+        and a 400 ms stall on the event loop is a missed Discord heartbeat.
+
+        `expires_in` is a ceiling, not a promise. The signature carries the session token
+        from the instance profile, and S3 rejects the request the moment that token
+        expires however much of `ExpiresIn` is left. botocore refreshes the profile at
+        15 minutes remaining, so a link is good for at least that long and may be good
+        for the full window -- which is why callers say "expires by", not "expires at".
+
+        The URL is a bearer credential for the world save. It must not be logged, and it
+        must not be posted anywhere a non-admin can read it.
+        """
+
+        def call() -> str:
+            params = {"Bucket": bucket, "Key": key}
+            if filename:
+                # Otherwise the file lands named after whatever a browser makes of a URL
+                # carrying a kilobyte of query string. `filename` is BACKUP_NAME-shaped
+                # (see server.py), so there is nothing here to quote or escape.
+                params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
+            return self._s3.generate_presigned_url(
+                "get_object", Params=params, ExpiresIn=expires_in
+            )
 
         return await asyncio.to_thread(call)
 

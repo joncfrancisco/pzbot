@@ -31,6 +31,7 @@ Discord ──▶ pzbot (t4g.nano, always on)
 | `/pz save` | **admin** | Forces a save now. |
 | `/pz backup now [label]` | **admin** | Labelled backup without stopping. |
 | `/pz backup list` | player | What is in the bucket. |
+| `/pz backup download [backup]` | **admin** | A private, time-limited S3 link to one archive. Latest by default. |
 | `/pz restore <backup>` | **admin** | Two-step confirm, autocompleted from S3. Destructive. |
 | `/pz config get\|set` | **admin** | An allowlist of `.ini` keys, then `reloadoptions`. Live. |
 | `/pz sandbox get [setting]` | player | The world's rules: time, zombies, infection, loot. |
@@ -68,6 +69,31 @@ so "saliva only" is a thing you pick rather than something you have to know is
                 apply:True
 ```
 
+### Getting a copy of the world off the server
+
+`/pz backup download` signs an S3 link to one archive and replies **only to the admin who
+asked** — the message is ephemeral, and the audit channel records that a download
+happened without recording the link. That matters twice over: the archive carries `db/`,
+where PZ keeps player accounts, and a presigned URL is a bearer credential that cannot be
+revoked once it is out. It is signed for fifteen minutes by default, which is a window to
+*start* the download in; S3 checks the signature when the request opens, not while a
+2 GB archive is still coming down the wire.
+
+It never touches the game server. The archive is in S3 whether or not an `m7i.xlarge` is
+running, and the moment you most want a copy of the world is the moment the box is broken
+— so this works with the instance stopped, and costs nothing to answer.
+
+What it *cannot* do is invent a save that does not exist yet. While the server is running
+the newest scheduled archive can be up to half an hour old, so the embed says so and
+points at `/pz backup now`, which forces an RCON `save` first. With the server stopped,
+the newest archive is the `prestop` one and there is nothing missing from it.
+
+```
+/pz backup download                       # the most recent archive
+/pz backup download minutes:60            # a longer window, for a slow link
+/pz backup now label:before-i-break-it    # then download that
+```
+
 ### Changing what the world *runs*, as opposed to what it is *like*
 
 `/pz version` and `/pz mods` are the two that can leave a save that will not open — a PZ
@@ -100,7 +126,7 @@ an item that is not on disk yet — so it takes two restarts: one to download, o
 
 **Deployed and running.** `pzbot.service` is `active (running)` and `enabled` on the bot
 host `i-09158ffe716ee3c5e`, serving guild `189561197673054208` against the live `prod`
-stack. 127 tests pass. All three setup steps — the Discord application, the
+stack. 201 tests pass. All three setup steps — the Discord application, the
 `/pz/prod/discord/*` parameters, and `deploy/install.sh` — are done; they are kept in
 [DEPLOY.md](DEPLOY.md) for rebuilds and rotations.
 

@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from . import rcon as rcon_mod
 from . import sandbox
-from .aws import Aws, AwsError, CommandResult, Instance, is_instance_gone
+from .aws import Aws, AwsError, Backup, CommandResult, Instance, is_instance_gone
 from .config import Config
 from .rcon import Rcon, RconAuthError, RconUnreachable
 
@@ -45,6 +45,15 @@ BACKUP_NAME = re.compile(
     r"\.tar\.zst$"
 )
 LABEL = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+# How long a `/pz backup download` link is signed for, in minutes. The ceiling is short
+# on purpose: the link is a bearer credential for an archive containing `db/`, which is
+# where player accounts live, and it cannot be revoked once handed out. Fifteen minutes
+# is plenty to *start* a download -- S3 checks the signature when the request opens, not
+# while the bytes are flowing, so a 2 GB archive on a slow line is unaffected.
+DOWNLOAD_TTL_DEFAULT = 15
+DOWNLOAD_TTL_MIN = 5
+DOWNLOAD_TTL_MAX = 60
 
 # Mirror pzserver's `pz-<stack>-version` and `pz-<stack>-mods` document patterns. Same
 # rule as BACKUP_NAME above: the document is the enforcement, this is the error message.
@@ -469,6 +478,61 @@ class GameServer:
             timeout=1800,
             comment="pzbot /pz backup now",
         )
+
+    async def download_url(
+        self, backup_name: str = "", *, minutes: int = DOWNLOAD_TTL_DEFAULT
+    ) -> tuple[Backup, str, int]:
+        """A time-limited link to one archive, or to the newest one when no name is given.
+
+        Returns the backup, the URL, and the number of seconds it was signed for.
+
+        This deliberately never touches the game server. The instance is stopped by
+        default and the archive is in S3 either way, so "give me the world save" must not
+        be a question that costs $0.20/hour to answer -- and the most likely moment to
+        want a copy is precisely when the server is off, or broken, or mid-argument about
+        whether to roll back.
+
+        The name is re-checked against the live listing before anything is signed, the
+        same rule `restore` follows. An autocomplete value can always be typed by hand,
+        and S3 will happily sign a URL for a key that does not exist: the admin would get
+        an XML `NoSuchKey` in a browser instead of a sentence explaining the typo.
+        """
+        minutes = max(DOWNLOAD_TTL_MIN, min(minutes, DOWNLOAD_TTL_MAX))
+
+        backups = await self.aws.list_backups(self.cfg.backup_bucket, self.cfg.stack)
+        if not backups:
+            raise OperationError(
+                f"There is nothing in `s3://{self.cfg.backup_bucket}/backups/"
+                f"{self.cfg.stack}/`. That is worth investigating on its own \N{EM DASH} "
+                "`pz-backup.sh` should be uploading every 30 minutes while the server runs."
+            )
+
+        if backup_name:
+            if not BACKUP_NAME.fullmatch(backup_name):
+                raise OperationError(
+                    f"`{backup_name}` is not a backup name produced by this stack."
+                )
+            found = next((b for b in backups if b.name == backup_name), None)
+            if found is None:
+                raise OperationError(
+                    f"No backup named `{backup_name}` in "
+                    f"`s3://{self.cfg.backup_bucket}/backups/{self.cfg.stack}/`. "
+                    "Use `/pz backup list` to see what exists."
+                )
+        else:
+            found = backups[0]  # list_backups sorts newest first
+
+        url = await self.aws.presign_backup(
+            self.cfg.backup_bucket,
+            found.key,
+            expires_in=minutes * 60,
+            filename=found.name,
+        )
+        # The name, never the URL. This line goes to journald and, via audit.py, to a
+        # channel -- and the URL in either place would be the download link leaking into
+        # a log with a longer retention than the link's own lifetime.
+        log.info("signed a %d-minute download link for %s", minutes, found.name)
+        return found, url, minutes * 60
 
     async def restore(self, backup_name: str, progress: Progress) -> CommandResult:
         """Stop PZ, restore, bring it back. The most dangerous thing the bot can do.

@@ -139,6 +139,16 @@ class FakeAws:
         self.calls.append(f"list_backups:{bucket}")
         return self.backups[:limit]
 
+    async def presign_backup(self, bucket, key, *, expires_in, filename="") -> str:
+        # Shaped like the real thing -- the query string is what tests assert on, and a
+        # bare "https://example" would let a caller that forgot `expires_in` pass.
+        self.calls.append(f"presign:{key}:{expires_in}")
+        return (
+            f"https://{bucket}.s3.amazonaws.com/{key}"
+            f"?X-Amz-Expires={expires_in}&X-Amz-Security-Token=fake"
+            f"&response-content-disposition=attachment%3B%20filename%3D%22{filename}%22"
+        )
+
     async def get_parameters_by_path(self, prefix: str) -> dict[str, str]:
         self.calls.append(f"params:{prefix}")
         return {k: v for k, v in self.parameters.items() if k.startswith(prefix)}

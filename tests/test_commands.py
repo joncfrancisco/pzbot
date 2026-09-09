@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -32,6 +32,7 @@ EXPECTED = {
     "pz save",
     "pz backup now",
     "pz backup list",
+    "pz backup download",
     "pz restore",
     "pz config get",
     "pz config set",
@@ -88,6 +89,15 @@ def test_stop_takes_a_force_flag(group):
 def test_restore_offers_autocomplete_rather_than_a_free_text_key(group):
     restore = next(c for c in group.commands if c.name == "restore")
     assert restore._params["backup"].autocomplete is not None
+
+
+def test_downloading_offers_the_same_picker_and_defaults_to_the_latest(group):
+    backups_group = next(c for c in group.commands if c.name == "backup")
+    download = next(c for c in backups_group.commands if c.name == "download")
+    assert download._params["backup"].autocomplete is not None
+    # Blank means "the most recent one" -- see GameServer.download_url. If this became a
+    # required parameter, the common case (get me the save) would need two commands.
+    assert not download._params["backup"].required
 
 
 def test_removing_a_mod_offers_the_ones_installed(group):
@@ -157,6 +167,25 @@ def test_backups_embed_says_so_when_there_are_none(cfg):
     embed = render.backups(cfg, [])
     assert "No backups" in (embed.description or "")
     assert embed.colour == render.BAD
+
+
+DOWNLOAD_URL = "https://bucket.s3.amazonaws.com/backups/prod/x.tar.zst?X-Amz-Signature=abc"
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_the_download_embed_only_promises_a_current_world_when_the_server_is_off(cfg, stage):
+    # A save pulled while the server is running is stale the moment it is signed, and
+    # the scheduled ones are half an hour apart. Someone debugging from an hour-old copy
+    # of the world without being told is the failure this warning exists to prevent.
+    item = backup("2026-08-22T19-24-30Z__prestop.tar.zst")
+    embed = render.download(
+        cfg, item, DOWNLOAD_URL, dt.datetime.now(dt.UTC) + dt.timedelta(minutes=15), stage=stage
+    )
+    body = (embed.description or "") + "".join(f"{f.name}{f.value}" for f in embed.fields)
+    running = stage in (Stage.READY, Stage.BOOTING, Stage.PENDING)
+    assert ("The server is running" in body) == running
+    assert DOWNLOAD_URL in body
+    assert len(embed) <= 6000
 
 
 def test_sizes_and_durations_read_like_english():
@@ -246,3 +275,73 @@ def test_a_single_setting_embed_marks_the_live_option(cfg):
 def test_a_world_gen_only_setting_says_so_before_someone_wastes_a_restart(cfg):
     embed = render.sandbox_setting("StartMonth", sandbox.SETTINGS["StartMonth"], "7")
     assert any("new world" in f.name for f in embed.fields)
+
+
+# --- Downloading a save ------------------------------------------------------------------
+
+
+def admin_interaction():
+    """Enough of an Interaction to run a command body against, as an admin in-channel."""
+    fake = MagicMock(spec=discord.Interaction)
+    fake.guild_id = 111
+    fake.channel_id = 444
+    fake.user = MagicMock(spec=discord.Member)
+    fake.user.id = 42
+    fake.user.roles = [SimpleNamespace(id=222)]  # cfg.role_admin
+    fake.user.display_name = "jon"
+    fake.command = SimpleNamespace(qualified_name="pz backup download")
+    fake.response = MagicMock()
+    fake.response.defer = AsyncMock()
+    fake.followup = MagicMock()
+    fake.followup.send = AsyncMock()
+    return fake
+
+
+async def run_download(group, ctx, **kwargs):
+    backup_group = next(c for c in group.commands if c.name == "backup")
+    command = next(c for c in backup_group.commands if c.name == "download")
+    ctx.audit.record = AsyncMock()
+    interaction = admin_interaction()
+    await command.callback(backup_group, interaction, **kwargs)
+    return interaction
+
+
+@pytest.fixture
+def ctx_with_a_backup(group, aws):
+    aws.backups = [backup("2026-08-22T19-24-30Z__prestop.tar.zst")]
+    return group.ctx
+
+
+async def test_the_download_link_goes_only_to_the_admin_who_asked(group, ctx_with_a_backup):
+    # The URL is a bearer credential for an archive containing db/, where PZ keeps player
+    # accounts. A non-ephemeral reply would hand it to the whole channel, and there is no
+    # way to revoke one once it is out.
+    interaction = await run_download(group, ctx_with_a_backup)
+
+    assert interaction.response.defer.await_args.kwargs["ephemeral"] is True
+    assert interaction.followup.send.await_args.kwargs["ephemeral"] is True
+
+
+async def test_the_audit_line_records_the_backup_and_not_the_link(group, ctx_with_a_backup):
+    # The audit channel and journald both outlive a fifteen-minute link. A URL written to
+    # either is a link that no longer expires.
+    await run_download(group, ctx_with_a_backup)
+
+    (_, action), kwargs = ctx_with_a_backup.audit.record.await_args
+    assert action == "backup download"
+    assert "2026-08-22T19-24-30Z__prestop.tar.zst" in kwargs["detail"]
+    assert "http" not in kwargs["detail"]
+    assert "X-Amz" not in kwargs["detail"]
+
+
+async def test_a_broken_game_server_still_gets_you_the_save(group, ctx_with_a_backup, aws):
+    # The instance was replaced and nothing carries the tag yet, so `probe` raises
+    # OperationError rather than an AWS error. That is one of the moments an admin most
+    # wants a copy of the world -- the freshness note is decoration, not a gate.
+    aws.gone = {"i-0test"}
+    aws.instance_id = ""
+
+    interaction = await run_download(group, ctx_with_a_backup)
+
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "X-Amz-Expires" in (embed.description or "")
