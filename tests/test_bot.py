@@ -133,6 +133,31 @@ async def test_a_failed_probe_does_not_kill_the_presence_loop(heartbeat_bot, aws
     assert "heartbeat" in aws.calls
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [client_error(), OperationError("the game server no longer exists")],
+)
+async def test_the_presence_probe_handles_the_failures_it_claims_to(cfg, server, failure):
+    # The tests above stub `_update_presence` out, so nothing exercised the handler
+    # *inside* it -- and it was written as `except (AwsError, OperationError)`, which
+    # looks right and is not. `AwsError` is a tuple, and a nested tuple in an except
+    # clause raises `TypeError: catching classes that do not inherit from BaseException`
+    # when the clause is evaluated. So the handler never ran: every AWS failure came back
+    # out of here as an unrelated TypeError and landed in `presence`'s catch-all as
+    # "presence update failed", with the real cause buried. The loop survived, which is
+    # exactly why it went unnoticed. Same trap as `case AwsError():` in this file's
+    # docstring, one clause away from it.
+    instance = PzBot.__new__(PzBot)
+    instance.cfg = cfg
+    instance.ctx = SimpleNamespace(server=server)
+    instance.change_presence = AsyncMock()
+    server.probe = AsyncMock(side_effect=failure)
+
+    await instance._update_presence()  # must not raise
+
+    instance.change_presence.assert_not_awaited()
+
+
 async def test_a_failed_heartbeat_does_not_kill_the_presence_loop(heartbeat_bot, aws):
     # tasks.loop stops on an unhandled exception. A PutMetricData throttle taking the
     # presence loop down would turn a cosmetic failure into a real outage -- and would
