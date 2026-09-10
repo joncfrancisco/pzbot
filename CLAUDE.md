@@ -22,7 +22,7 @@ systemd on AL2023 arm64. No web framework, no database, no state on disk.
 ```bash
 pip install -e '.[dev]'
 ruff check src tests && ruff format --check src tests
-pytest -q                      # 154 tests, no network, ~2s
+pytest -q                      # 201 tests, no network, ~2s
 ```
 
 There is no Python 3.12 on this Mac (system Python is 3.9, and there is no Homebrew).
@@ -57,7 +57,7 @@ src/pzbot/
   commands/
     base.py      ← Ctx, the self-editing progress message, the TTL cache
     core.py      ← /pz status start stop who restart save idle cost restore, /pz config
-    backups.py   ← /pz backup now|list and the restore autocomplete
+    backups.py   ← /pz backup now|list|download and the restore autocomplete
     world.py     ← /pz sandbox get|set, with both halves of the picker autocompleted
     maintenance.py← /pz version and /pz mods — the two that change what CODE the world runs
 deploy/          ← pzbot.service, install.sh (idempotent; also the upgrade path), env template
@@ -170,6 +170,29 @@ the two rules from DESIGN §10 are enforced so that no command can forget them.
   `ssm_prefix` mirrors pzserver's parameter tree. Renaming a document on either side
   without the other is a silent break — SSM's error for an unknown document name does
   not mention this convention at all.
+- **A `/pz backup download` link is a bearer credential, and it cannot be recalled.**
+  Anyone holding the URL can pull the archive until it expires, and the archive contains
+  `db/` -- PZ's player accounts. Hence three things that all have to stay true together:
+  the command is ADMIN (`/pz backup list` can be player tier because knowing an archive
+  exists is not holding it), the reply is `ephemeral=True`, and `audit.record` gets the
+  backup name and the window but **never the URL**. The audit channel and journald both
+  outlive the fifteen-minute link; a URL logged there is a link with no expiry.
+- **S3 presigning is pinned to SigV4 on purpose** (`_S3` in `aws.py`). botocore will
+  otherwise presign with SigV2, which S3 refuses on every bucket created after June 2020
+  -- and `pz-<stack>-backups` is one. Nothing on this side sees the failure: the URL is
+  generated without complaint and answers `InvalidRequest: Please use AWS4-HMAC-SHA256`
+  in the admin's browser. `test_a_download_link_is_signed_for_one_object_and_one_window`
+  is the guard, and `AWSAccessKeyId=` in a URL is the tell.
+- **Downloading needs no new IAM.** `pz-bot-role`'s `ReadBackups` statement
+  (`s3:GetObject` on `backups/*`) is what `/pz restore` already needed; a presigned URL
+  is signed locally and evaluated against that role when it is *used*, so a signature can
+  never reach an object the bot could not read anyway. This is the rare pzbot change that
+  does not need a `pzserver` apply -- do not add a statement for it.
+- **`download_url` must never touch the game server.** No `probe()` gate, no
+  `send_command`: the box is stopped by default, the archive is in S3 either way, and the
+  moment somebody most wants a copy of the world is the moment the instance is broken or
+  costing $0.20/hour. The stage shown in the embed is decoration, fetched separately and
+  wrapped in `except AwsError` for that reason.
 - **`deploy/install.sh` must stay idempotent** — it is the upgrade path, and it runs as
   root on the only host that can reach the game server.
 - **Never hand-edit `requirements.txt`.** It is a `pip-compile` lockfile and the installer

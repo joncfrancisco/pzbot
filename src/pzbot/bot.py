@@ -112,7 +112,15 @@ class PzBot(discord.Client):
     async def _update_presence(self) -> None:
         try:
             snap = await self.ctx.server.probe(rcon_timeout=4.0)
-        except (AwsError, OperationError):
+        except (*AwsError, OperationError):
+            # Unpacked, not `(AwsError, OperationError)`. `AwsError` is a *tuple* of
+            # classes, and a nested tuple in an `except` raises TypeError("catching
+            # classes that do not inherit from BaseException") when the clause is
+            # evaluated -- so this handler did nothing except turn every AWS failure into
+            # a different exception. The loop survived on `presence`'s outer catch-all,
+            # which is why it never showed up as anything but a misleading log line.
+            # Same trap as `case AwsError():` further down; see the comment there.
+            #
             # A stopped stack, a mid-apply AccessDenied, a game server that no longer
             # exists: all of them are things to say in the log and re-check in sixty
             # seconds, not reasons to stop watching.

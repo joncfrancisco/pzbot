@@ -336,6 +336,73 @@ async def test_backup_label_is_passed_through_when_sane(server, aws):
     assert aws.commands == [("pz-prod-backup", {"mode": "manual", "label": "before-b42"})]
 
 
+# --- Download links --------------------------------------------------------------------
+
+
+async def test_download_defaults_to_the_newest_backup(server, aws):
+    aws.backups = [
+        backup(GOOD, minutes_ago=5),
+        backup("2026-08-01T00-00-00Z__manual.tar.zst", minutes_ago=900),
+    ]
+    item, url, ttl = await server.download_url()
+    assert item.name == GOOD
+    assert ttl == 15 * 60
+    assert item.key in url
+
+
+async def test_download_signs_the_backup_that_was_asked_for(server, aws):
+    older = "2026-08-01T00-00-00Z__manual.tar.zst"
+    aws.backups = [backup(GOOD, minutes_ago=5), backup(older, minutes_ago=900)]
+    item, url, _ = await server.download_url(older)
+    assert item.name == older
+    assert older in url
+
+
+async def test_download_refuses_a_name_that_is_not_a_backup_name(server, aws):
+    # Same rule as restore: this value comes out of a Discord text box, and a key is a
+    # path. `../` here would sign a URL for something outside backups/<stack>/, which is
+    # the one place the bot's own IAM policy lets it read.
+    aws.backups = [backup(GOOD)]
+    for hostile in ("../../ops/secrets.env", "$(curl evil.example)", f"{GOOD} && reboot"):
+        with pytest.raises(OperationError, match="not a backup name"):
+            await server.download_url(hostile)
+    assert not any(c.startswith("presign:") for c in aws.calls)
+
+
+async def test_download_refuses_a_name_that_is_not_in_the_bucket(server, aws):
+    aws.backups = [backup("2026-08-01T00-00-00Z__manual.tar.zst")]
+    with pytest.raises(OperationError, match="No backup named"):
+        await server.download_url(GOOD)
+    assert not any(c.startswith("presign:") for c in aws.calls)
+
+
+async def test_download_says_so_when_the_bucket_is_empty(server, aws):
+    aws.backups = []
+    with pytest.raises(OperationError, match="nothing in"):
+        await server.download_url()
+
+
+async def test_download_never_touches_the_game_server(server, aws):
+    # The whole point: the instance is stopped by default, and the archive is in S3
+    # either way. Starting an m7i.xlarge to hand someone a copy of the world would be
+    # absurd -- and the moment you most want a copy is when the box is broken.
+    aws.state = "stopped"
+    aws.backups = [backup(GOOD)]
+    await server.download_url()
+    assert aws.commands == []
+    assert not any(c.startswith(("start:", "describe:")) for c in aws.calls)
+
+
+@pytest.mark.parametrize(("asked", "signed"), [(1, 5), (15, 15), (999, 60)])
+async def test_the_link_lifetime_is_clamped(server, aws, asked, signed):
+    # `app_commands.Range` bounds what Discord will send, but nothing stops another
+    # caller -- or a later command -- passing whatever it likes. The ceiling is a
+    # security property of a credential that cannot be revoked once it is handed out.
+    aws.backups = [backup(GOOD)]
+    _, _, ttl = await server.download_url(minutes=asked)
+    assert ttl == signed * 60
+
+
 # --- Config allowlist ------------------------------------------------------------------
 
 

@@ -189,6 +189,61 @@ def backups(cfg: Config, items: list[Backup], limit: int = 10) -> discord.Embed:
     return embed
 
 
+def download(
+    cfg: Config, item: Backup, url: str, expires_at: dt.datetime, *, stage: Stage
+) -> discord.Embed:
+    """The one embed in this file that must never be posted where a player can read it.
+
+    The link is a bearer credential -- anyone holding it can pull the archive until it
+    expires, and the archive carries `db/`, which is where player accounts live. The
+    command sends this ephemerally for exactly that reason: the audit channel gets the
+    fact of the download, never the means to repeat it.
+    """
+    embed = discord.Embed(
+        title="💾  World save",
+        colour=IDLE,
+        description=(
+            f"**[Download `{item.name}` ({size(item.size)})]({url})**\n"
+            "Right-click → Copy Link if you would rather `curl -O` it."
+        ),
+    )
+    label = f" · `{item.label}`" if item.label else ""
+    embed.add_field(name="Taken", value=f"{ts(item.modified)} · `{item.trigger}`{label}")
+    embed.add_field(name="Link works until", value=f"{ts(expires_at)}, at most")
+
+    # Whether this archive *is* the current world depends entirely on what the server is
+    # doing, and getting that wrong is the whole failure mode of a download command:
+    # someone pulls a copy to fix a problem, works from it for an hour, and it turns out
+    # to have been half an hour stale before they started.
+    if stage in (Stage.READY, Stage.BOOTING, Stage.PENDING):
+        embed.add_field(
+            name="⚠️  The server is running",
+            value=(
+                "so this archive stops at the timestamp above and the scheduled ones are "
+                "half an hour apart. For the world as it stands right now, `/pz backup now` "
+                "first — it forces an RCON `save` — then run this again."
+            ),
+            inline=False,
+        )
+    elif stage is Stage.STOPPED and item.trigger == "prestop":
+        embed.add_field(
+            name="The server is stopped",
+            value="and this is its `prestop` archive, so it is the world exactly as it was left.",
+            inline=False,
+        )
+
+    embed.add_field(
+        name="Inside",
+        value=(
+            f"`Saves/Multiplayer/{cfg.server_name}`, `Server/` and `db/` — the three "
+            f"parts, as a set.\nUnpack with `tar --zstd -xf {item.name}`."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"{item.key} · only you can see this message")
+    return embed
+
+
 def cost(cfg: Config, spend: Cost) -> discord.Embed:
     embed = discord.Embed(title="Spend, month to date", colour=IDLE)
     embed.add_field(name=f"`pz:stack={cfg.stack}`", value=f"**${spend.stack_usd:.2f}**")
