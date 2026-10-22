@@ -124,6 +124,26 @@ an item that is not on disk yet — so it takes two restarts: one to download, o
 
 ## Status
 
+**⏸️ Not running — the infrastructure was wound down on 2026-10-22.** `pzbot.service` was
+stopped and disabled, and the bot host `i-09158ffe716ee3c5e` was terminated along with the
+game server, to stop paying for a server last played on 2026-09-05. **Nothing in this repo
+was lost and nothing here needs changing** — the host was cattle, the code is here, and
+the Discord application and all `/pz/prod/discord/*` parameters (token included) are
+untouched in Parameter Store.
+
+Slash commands will fail until the host is rebuilt. The order is: bring the infrastructure
+back first per
+[pzserver DEPLOY.md § Restarting after a wind-down](../pzserver/DEPLOY.md#restarting-after-a-wind-down),
+which recreates the host and its IAM role, **then** redeploy this bot with
+`deploy/install.sh` per [DEPLOY.md](DEPLOY.md). The new host will have a **new instance id
+and a new public IP**, so any note that hardcodes `i-09158ffe716ee3c5e` — including the
+command below — is stale until you re-read `terraform output bot_contract`.
+
+201 tests pass; CI is unaffected by the wind-down.
+
+<details>
+<summary>Status while it was deployed (2026-08-23 → 2026-10-22)</summary>
+
 **Deployed and running.** `pzbot.service` is `active (running)` and `enabled` on the bot
 host `i-09158ffe716ee3c5e`, serving guild `189561197673054208` against the live `prod`
 stack. 201 tests pass. All three setup steps — the Discord application, the
@@ -136,6 +156,8 @@ To see which build is actually on the box:
 aws ssm start-session --target i-09158ffe716ee3c5e
 git -C /opt/pzbot/src log --oneline -1
 ```
+
+</details>
 
 `/pz start` is the normal way to bring the world up. The CLI equivalents
 (`aws ec2 start-instances` / `stop-instances`) still work and are the fallback for when

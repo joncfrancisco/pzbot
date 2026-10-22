@@ -7,12 +7,26 @@ default**. Runs as `pzbot.service` on the always-on `t4g.nano` bot host in accou
 `020949219706`. The design of record is pzserver's `DESIGN.md` §10 — that table is the
 contract this repo implements, and `tests/test_commands.py` asserts it.
 
-**This is live.** [pzserver](../pzserver) was applied on 2026-08-22 and `pzbot.service`
-has been running on the bot host `i-09158ffe716ee3c5e` since 2026-08-23 — the Discord
-application, the `/pz/prod/discord/*` parameters and `deploy/install.sh` are all done.
-Changes merged here do **not** reach the box on their own; deploying is a `git pull` plus
-`deploy/install.sh` over SSM. Check what is actually running with
-`git -C /opt/pzbot/src log --oneline -1` before assuming main and prod agree. See
+**This is NOT currently running.** [pzserver](../pzserver) was wound down on 2026-10-22:
+`pzbot.service` was stopped and disabled and the bot host was terminated, so there is no
+box to deploy to and no `aws ssm start-session` target. Nothing in this repo was lost —
+the code is here and the Discord application and `/pz/prod/discord/*` parameters survive
+in Parameter Store.
+
+What this means while working here:
+
+- **There is no prod to compare against.** Do not try to check what is on the box, and
+  treat the instance id `i-09158ffe716ee3c5e` as dead wherever it appears in these docs.
+- **Deploying requires the infrastructure first.** Rebuild it per
+  [pzserver DEPLOY.md § Restarting after a wind-down](../pzserver/DEPLOY.md#restarting-after-a-wind-down),
+  then read `terraform output bot_contract` for the new host, then `deploy/install.sh`.
+- **Code changes are safe to make and merge**; CI is unaffected. They simply will not be
+  running anywhere until the above happens.
+
+While it was live, from 2026-08-23: `pzbot.service` ran on bot host
+`i-09158ffe716ee3c5e`; changes merged here did **not** reach the box on their own —
+deploying was a `git pull` plus `deploy/install.sh` over SSM, and
+`git -C /opt/pzbot/src log --oneline -1` was how you checked main against prod. See
 [DEPLOY.md](DEPLOY.md).
 
 ## Stack & Commands
