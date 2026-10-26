@@ -53,7 +53,14 @@ jobs:
       # This is that failed CI run.
       - name: requirements.txt is in sync with requirements.in
         run: |
-          pip install --quiet pip-tools
+          # PINNED on purpose. This step compares the committed file against a freshly
+          # generated one, and pip-tools writes the invocation it was given into a header
+          # comment -- so its own rendering of that line is part of what gets compared.
+          # 7.6.2 stopped echoing the implied `--no-index` that 7.6.1 emitted, which broke
+          # this check on every PR without any dependency having changed. Unpinned, the
+          # next such change breaks it again. Bump deliberately, and regenerate
+          # requirements.txt in the same commit.
+          pip install --quiet pip-tools==7.6.2
           cp requirements.txt requirements.txt.committed
           pip-compile --generate-hashes --strip-extras --quiet \
             --output-file=requirements.txt requirements.in
